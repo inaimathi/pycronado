@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycronado"
+version = "0.0.0"
+authors = [
+  { name="inaimathi", email="leo.zovic@gmail.com" },
+]
+description = "Set of trivial tools for building microservices with Tornado"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = ["tornado"]
+
+[project.urls]
+Homepage = "https://github.com/inaimathi/pycronado"
+Issues = "https://github.com/inaimathi/pycronado/issues"
