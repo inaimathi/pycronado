@@ -1,5 +1,6 @@
 import asyncio
 import json
+from asyncio import run
 
 import tornado
 
@@ -43,27 +44,25 @@ class Default404Handler(PublicJSONHandler):
         return self.request.connection.close()
 
 
-def getApp(
-    name, routes, static_path=None, static_url_prefix=None, default_handler_class=None
+async def start(
+    name,
+    port,
+    routes,
+    static_path=None,
+    static_url_prefix=None,
+    default_handler_class=None,
+    debug=False,
 ):
     if default_handler_class is None:
         default_handler_class = Default404Handler
     app = tornado.web.Application(
         routes,
         default_handler_class=default_handler_class,
-        debug=True,
+        debug=debug,
         static_path=static_path,
         static_url_prefix=static_url_prefix,
     )
     app.logger = getLogger(name)
-    return app
-
-
-async def start(app, port):
-    app.logger.info(f"Listening on {port}")
+    app.logger.info(f"  listening on {port}...")
     app.listen(int(port))
     await asyncio.Event().wait()
-
-
-def run(app, port):
-    asyncio.run(start(app, port))
