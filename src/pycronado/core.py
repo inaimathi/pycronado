@@ -1,9 +1,11 @@
 import asyncio
 import json
+import re
 from asyncio import run
 
 import tornado
 
+from . import token
 from .util import getLogger
 
 
@@ -23,6 +25,12 @@ class PublicJSONHandler(tornado.web.RequestHandler):
     def set_default_headers(self):
         self.set_header("Content-Type", "application/json")
 
+    def jwt(self):
+        auth_header = self.request.headers.get("Authorization")
+        if auth_header is not None:
+            return re.sub("^Bearer +", "", auth_header)
+        return None
+
     def param(self, param_name, default=None):
         if self._data is None:
             try:
@@ -35,6 +43,28 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         if status is not None:
             self.set_status(status)
         return self.write(json.dumps(data))
+
+
+class JSONHandler(PublicJSONHandler):
+    def prepare(self):
+        self._logger = None
+        self._data = None
+        self.set_header("Access-Control-Allow-Origin", "*")
+        self.set_header("Access-Control-Allow-Headers", "*")
+        self.set_header("Access-Control-Allow-Methods", "*")
+        if self.jwt() is None:
+            self.json({"status": "error", "message": "forbidden"}, 403)
+            self.finish()
+            return
+        try:
+            token.decode(self.jwt())
+        except Exception:
+            self.json({"status": "error", "message": "forbidden"}, 403)
+            self.finish()
+            return
+
+    def decodedJwt(self):
+        return token.decode(self.jwt())
 
 
 class Default404Handler(PublicJSONHandler):
