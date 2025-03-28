@@ -1,5 +1,7 @@
 import asyncio
 import json
+import mimetypes
+import os
 import re
 from asyncio import run
 
@@ -38,6 +40,33 @@ class PublicJSONHandler(tornado.web.RequestHandler):
             except json.JSONDecodeError:
                 self._data = {}
         return self._data.get(param_name, self.get_argument(param_name, default))
+
+    def file(self, fpath, mimetype=None):
+        assert os.path.exists(fpath), f"Path {fpath} does not exist"
+        assert os.path.isfile(fpath), f"Path {fpath} is not a file"
+
+        if mimetype is None:
+            content_type, encoding = mimetypes.guess_type(fpath)
+            mimetype = content_type
+
+        assert mimetype, f"Could not infer mimetype of {fpath} and no default provided"
+
+        self.set_header("Content-Type", mimetype)
+        self.set_header("Content-Length", os.path.getsize(fpath))
+
+        with open(fpath, "rb") as f:
+            while True:
+                chunk = f.read(65 * 1024)
+                if not chunk:
+                    break
+                self.write(chunk)
+                self.flush()
+
+        self.finish()
+
+    def jsonerr(self, message, status=500):
+        self.json({"status": "error", "message": message}, status)
+        self.finish()
 
     def json(self, data, status=None):
         if status is not None:
