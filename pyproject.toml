@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycronado"
-version = "0.0.2"
+version = "0.0.3"
 authors = [
   { name="inaimathi", email="leo.zovic@gmail.com" },
 ]
@@ -16,7 +16,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dependencies = ["tornado"]
+dependencies = ["tornado", "pyjwt[crypto]"]
 
 [project.urls]
 Homepage = "https://github.com/inaimathi/pycronado"
