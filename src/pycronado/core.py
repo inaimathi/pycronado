@@ -73,6 +73,9 @@ class PublicJSONHandler(tornado.web.RequestHandler):
             self.set_status(status)
         return self.write(json.dumps(data))
 
+    def options(self):
+        return self.json({"status": "ok"})
+
 
 class JSONHandler(PublicJSONHandler):
     def prepare(self):
