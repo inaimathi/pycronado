@@ -35,27 +35,23 @@ class PublicJSONHandler(tornado.web.RequestHandler):
 
     def param(self, param_name, default=None):
         if self._data is None:
-            try:
-                self._data = json.loads(self.request.body)
-            except json.JSONDecodeError:
+            content_type = self.request.headers.get("Content-Type", "")
+            if self.request.body and "application/json" in content_type:
+                try:
+                    self._data = json.loads(self.request.body)
+                except json.JSONDecodeError:
+                    self._data = {}
+            else:
                 self._data = {}
+                json_data = self.get_body_argument("json", None)
+                if json_data:
+                    try:
+                        self._data.update(json.loads(json_data))
+                    except json.JSONDecodeError:
+                        pass
         return self._data.get(param_name, self.get_argument(param_name, default))
 
     def file_param(self, param_name, default=None, max_filesize=20 * 1024 * 1024):
-        """
-        Retrieve an uploaded file's contents from the request.
-
-        Args:
-            param_name (str): The name of the file parameter in the request
-            default: Value to return if the file is not found
-            max_filesize (int): Maximum allowed file size in bytes, defaults to 20MB
-
-        Returns:
-            bytes or default: The file content as bytes, or default if no file found
-
-        Raises:
-            HTTPError: If the file exceeds the maximum allowed size
-        """
         files = self.request.files.get(param_name)
         if not files:
             return default
