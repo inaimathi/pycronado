@@ -103,6 +103,9 @@ class PublicJSONHandler(tornado.web.RequestHandler):
     def ok(self, **kwargs):
         return self.json(kwargs, 200)
 
+    def TODO(self, **kwargs):
+        return self.json({"status": "TODO", **kwargs}, 501)
+
 
 class JSONHandler(PublicJSONHandler):
     def prepare(self):
