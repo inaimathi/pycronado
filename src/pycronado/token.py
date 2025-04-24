@@ -8,6 +8,7 @@ from jwt.exceptions import InvalidTokenError
 JWT_PRIVKEY = ENV.get("JWT_PRIVKEY")
 JWT_PRIVKEY_PASSWORD = ENV.get("JWT_PRIVKEY_PASSWORD")
 JWT_PUBKEY = ENV.get("JWT_PUBKEY")
+JWT_ISSUER = ENV.get("JWT_ISSUER")
 
 
 def ensureKeysFromPEM(private_key_pem):
@@ -66,6 +67,7 @@ def decode(tok):
     return jwt.decode(
         tok,
         JWT_PUBKEY,
+        issuer=JWT_ISSUER,
         algorithms=["RS256"],
     )
 
