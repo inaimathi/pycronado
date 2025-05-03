@@ -98,7 +98,8 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         return self.write(json.dumps(data))
 
     def options(self):
-        return self.json({"status": "ok"})
+        self.set_status(204)
+        self.finish()
 
     def ok(self, **kwargs):
         return self.json(kwargs, 200)
@@ -109,11 +110,11 @@ class PublicJSONHandler(tornado.web.RequestHandler):
 
 class JSONHandler(PublicJSONHandler):
     def prepare(self):
-        self._logger = None
-        self._data = None
-        self.set_header("Access-Control-Allow-Origin", "*")
-        self.set_header("Access-Control-Allow-Headers", "*")
-        self.set_header("Access-Control-Allow-Methods", "*")
+        super().prepare()
+
+        if self.request.method == "OPTIONS":
+            return
+
         if self.jwt() is None:
             self.json({"status": "error", "message": "forbidden"}, 403)
             self.finish()
