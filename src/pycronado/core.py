@@ -88,6 +88,24 @@ class PublicJSONHandler(tornado.web.RequestHandler):
 
         self.finish()
 
+    def filebytes(self, data, mimetype=None, extension=None):
+        assert isinstance(data, bytes), f"Data must be bytes, got {type(data)}"
+        assert mimetype or extension, "Mimetype or extension is required for filebytes"
+
+        if mimetype is None:
+            mimetype = mimetypes.guess_type(f"foo.{extension}")
+
+        self.set_header("Content-Type", mimetype)
+        self.set_header("Content-Length", len(data))
+
+        chunk_size = 65 * 1024
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i : i + chunk_size]
+            self.write(chunk)
+            self.flush()
+
+        self.finish()
+
     def jsonerr(self, message, status=500):
         self.json({"status": "error", "message": message}, status)
         self.finish()
@@ -102,7 +120,7 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         self.finish()
 
     def ok(self, **kwargs):
-        return self.json(kwargs, 200)
+        return self.json({"status": "ok", **kwargs}, 200)
 
     def TODO(self, **kwargs):
         return self.json({"status": "TODO", **kwargs}, 501)
