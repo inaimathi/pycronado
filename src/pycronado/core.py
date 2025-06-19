@@ -155,6 +155,15 @@ class Default404Handler(PublicJSONHandler):
         return self.request.connection.close()
 
 
+class HealthHandler(PublicJSONHandler):
+    def get(self):
+        val = self.param("value", None)
+        res = {"status": "ok"}
+        if val is not None:
+            res["value"] = str(val)[0:256]
+        return self.json(res)
+
+
 async def start(
     name,
     port,
