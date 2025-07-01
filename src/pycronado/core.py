@@ -133,7 +133,7 @@ class PublicJSONHandler(tornado.web.RequestHandler):
             self.set_status(status)
         return self.write(json.dumps(data))
 
-    def options(self):
+    def options(self, **_kwargs):
         self.set_status(204)
         self.finish()
 
