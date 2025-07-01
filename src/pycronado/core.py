@@ -11,6 +11,24 @@ from . import token
 from .util import getLogger
 
 
+def requires(*param_names):
+    """Decorator to enforce required parameters consistently."""
+
+    def decorator(method):
+        def wrapper(self, *args, **kwargs):
+            for param_name in param_names:
+                value = self.param(param_name)
+                if value is None:
+                    return self.jsonerr(f"`{param_name}` parameter is required", 400)
+                # Store the param value in kwargs for the method to use
+                kwargs[param_name] = value
+            return method(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 class PublicJSONHandler(tornado.web.RequestHandler):
     def prepare(self):
         self._logger = None
@@ -126,7 +144,27 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         return self.json({"status": "TODO", **kwargs}, 501)
 
 
-class JSONHandler(PublicJSONHandler):
+class UserMixin:
+    def token(self):
+        if not hasattr(self, "JWT"):
+            self.JWT = self.decodedJwt()
+        return self.JWT
+
+    def issuer(self):
+        return self.decodedJwt()["iss"]
+
+    def user(self):
+        jwt = self.decodedJwt()
+        return jwt["user"]
+
+    def username(self):
+        return self.user()["username"]
+
+    def userId(self):
+        return f"{self.issuer()}::{self.username()}"
+
+
+class JSONHandler(PublicJSONHandler, UserMixin):
     def prepare(self):
         super().prepare()
 
