@@ -147,6 +147,7 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         # If you're behind nginx, this prevents proxy buffering of the stream
         self.set_header("X-Accel-Buffering", "no")
         # Ensure we don't send a Content-Length for a streaming response
+        self.set_header("Vary", "Accept")
         try:
             self.clear_header("Content-Length")
         except Exception:
@@ -175,6 +176,10 @@ class PublicJSONHandler(tornado.web.RequestHandler):
             self.finish()
         except Exception:
             pass
+
+    def expects_ndjson(self) -> bool:
+        accept = (self.request.headers.get("Accept") or "").lower()
+        return "application/x-ndjson" in accept
 
     def options(self, *_args, **_kwargs):
         self.set_status(204)
