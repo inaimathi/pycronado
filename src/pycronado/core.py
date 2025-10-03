@@ -57,7 +57,8 @@ class PublicJSONHandler(tornado.web.RequestHandler):
             content_type = self.request.headers.get("Content-Type", "")
             if self.request.body and "application/json" in content_type:
                 try:
-                    self._data = json.loads(self.request.body)
+                    parsed = json.loads(self.request.body)
+                    self._data = parsed if isinstance(parsed, dict) else {}
                 except json.JSONDecodeError:
                     self._data = {}
             else:
