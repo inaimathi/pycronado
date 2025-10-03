@@ -33,6 +33,7 @@ class PublicJSONHandler(tornado.web.RequestHandler):
     def prepare(self):
         self._logger = None
         self._data = None
+        self._ndjson_started = False
         self.set_header("Access-Control-Allow-Origin", "*")
         self.set_header("Access-Control-Allow-Headers", "*")
         self.set_header("Access-Control-Allow-Methods", "*")
@@ -132,6 +133,48 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         if status is not None:
             self.set_status(status)
         return self.write(json.dumps(data))
+
+    def ndjson_start(self, status=None):
+        if self._ndjson_started:
+            return
+
+        if status is not None:
+            self.set_status(status)
+
+        self.set_header("Content-Type", "application/x-ndjson")
+        self.set_header("Cache-Control", "no-cache, no-transform")
+        self.set_header("Connection", "keep-alive")
+        # If you're behind nginx, this prevents proxy buffering of the stream
+        self.set_header("X-Accel-Buffering", "no")
+        # Ensure we don't send a Content-Length for a streaming response
+        try:
+            self.clear_header("Content-Length")
+        except Exception:
+            pass
+
+        try:
+            self.flush()
+        except Exception:
+            pass
+
+        self._ndjson_started = True
+
+    def ndjson(self, data, status=None):
+        if not self._ndjson_started:
+            self.ndjson_start(status=status)
+
+        self.write(json.dumps(data) + "\n")
+        try:
+            self.flush()
+        except Exception:
+            pass
+        return
+
+    def ndjson_end(self):
+        try:
+            self.finish()
+        except Exception:
+            pass
 
     def options(self, *_args, **_kwargs):
         self.set_status(204)
