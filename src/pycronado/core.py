@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import re
+from asyncio import run
 from typing import Any, AsyncIterator, Iterator
 
 import tornado
@@ -94,7 +95,24 @@ class NDJSONMixin:
         try:
             for item in it:
                 self.ndjson(item)
+
+        except tornado.iostream.StreamClosedError:
+            return
+
+        except GeneratorExit:
+            try:
+                self.ndjson({"type": "error", "message": "stream cancelled"})
+            finally:
+                self.ndjson_end()
+
+        except Exception:
+            try:
+                self.ndjson({"type": "error", "message": "internal server error"})
+            finally:
+                self.ndjson_end()
+
         finally:
+            # Idempotent; safe even if already finished above.
             self.ndjson_end()
 
     # ------------------------------- Async API -------------------------------
@@ -139,6 +157,24 @@ class NDJSONMixin:
         try:
             async for item in ait:
                 await self.andjson(item)
+
+        except asyncio.CancelledError:
+            try:
+                await self.andjson({"type": "error", "message": "stream cancelled"})
+            finally:
+                await self.andjson_end()
+
+        except Exception as e:
+            payload = (
+                on_error(e)
+                if on_error
+                else {"type": "error", "message": "internal server error"}
+            )
+            try:
+                await self.andjson(payload)
+            finally:
+                await self.andjson_end()
+
         finally:
             await self.andjson_end()
 
