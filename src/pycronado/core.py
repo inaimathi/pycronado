@@ -1,11 +1,14 @@
+# pycronado/core.py
+
 import asyncio
 import json
 import mimetypes
 import os
 import re
-from asyncio import run
+from typing import Any, AsyncIterator, Iterator
 
 import tornado
+import tornado.iostream
 
 from . import token
 from .util import getLogger
@@ -29,11 +32,122 @@ def requires(*param_names):
     return decorator
 
 
+class NDJSONMixin:
+    def expects_ndjson(self) -> bool:
+        accept = (self.request.headers.get("Accept") or "").lower()
+        return "application/x-ndjson" in accept
+
+    def _ensure_ndjson_headers(self, status: int | None = None) -> None:
+        if status is not None:
+            self.set_status(status)
+        self.set_header("Content-Type", "application/x-ndjson")
+        self.set_header("Cache-Control", "no-cache, no-transform")
+        self.set_header("Connection", "keep-alive")
+        # Prevent proxy buffering (e.g., nginx) of streaming responses
+        self.set_header("X-Accel-Buffering", "no")
+        self.set_header("Vary", "Accept")
+        try:
+            self.clear_header("Content-Length")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _encode_line(data: Any) -> str:
+        return (
+            data
+            if isinstance(data, str)
+            else json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        ) + "\n"
+
+    def ndjson_start(self, status: int | None = None) -> None:
+        if getattr(self, "_ndjson_started", False):
+            return
+        self._ensure_ndjson_headers(status)
+        try:
+            self.flush()
+        except Exception:
+            # best-effort; continue either way
+            pass
+        self._ndjson_started = True
+
+    def ndjson(self, data: Any, status: int | None = None) -> None:
+        if not getattr(self, "_ndjson_started", False):
+            self.ndjson_start(status=status)
+        line = self._encode_line(data)
+        self.write(line)
+        try:
+            self.flush()
+        except Exception:
+            # swallow transient client/transport errors during streaming
+            pass
+
+    def ndjson_end(self) -> None:
+        try:
+            if not getattr(self, "_finished", False):
+                self.finish()
+        except Exception:
+            pass
+
+    def ndjson_pump(self, it: Iterator[Any], status: int = 200) -> None:
+        """Stream a synchronous iterator into the response."""
+        self.ndjson_start(status)
+        try:
+            for item in it:
+                self.ndjson(item)
+        finally:
+            self.ndjson_end()
+
+    # ------------------------------- Async API -------------------------------
+
+    async def andjson_start(self, status: int | None = None) -> None:
+        if getattr(self, "_ndjson_started", False):
+            return
+        self._ensure_ndjson_headers(status)
+        try:
+            await self.flush()
+        except tornado.iostream.StreamClosedError:
+            return
+        except Exception:
+            pass
+        self._ndjson_started = True
+
+    async def andjson(self, data: Any, status: int | None = None) -> None:
+        if not getattr(self, "_ndjson_started", False):
+            await self.andjson_start(status=status)
+        line = self._encode_line(data)
+        self.write(line)
+        try:
+            # backpressure-aware; yields IOLoop so other requests keep flowing
+            await self.flush()
+        except tornado.iostream.StreamClosedError:
+            return
+        except Exception:
+            pass
+        # brief cooperative yield for very chatty streams
+        await asyncio.sleep(0)
+
+    async def andjson_end(self) -> None:
+        try:
+            if not getattr(self, "_finished", False):
+                self.finish()
+        except Exception:
+            pass
+
+    async def andjson_pump(self, ait: AsyncIterator[Any], status: int = 200) -> None:
+        """Stream an asynchronous iterator into the response."""
+        await self.andjson_start(status)
+        try:
+            async for item in ait:
+                await self.andjson(item)
+        finally:
+            await self.andjson_end()
+
+
 class PublicJSONHandler(tornado.web.RequestHandler):
     def prepare(self):
         self._logger = None
         self._data = None
-        self._ndjson_started = False
+        # NOTE: no NDJSON flags here; NDJSON state is confined to NDJSONMixin.
         self.set_header("Access-Control-Allow-Origin", "*")
         self.set_header("Access-Control-Allow-Headers", "*")
         self.set_header("Access-Control-Allow-Methods", "*")
@@ -90,7 +204,7 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         assert os.path.isfile(fpath), f"Path {fpath} is not a file"
 
         if mimetype is None:
-            content_type, encoding = mimetypes.guess_type(fpath)
+            content_type, _encoding = mimetypes.guess_type(fpath)
             mimetype = content_type
 
         assert mimetype, f"Could not infer mimetype of {fpath} and no default provided"
@@ -133,54 +247,7 @@ class PublicJSONHandler(tornado.web.RequestHandler):
     def json(self, data, status=None):
         if status is not None:
             self.set_status(status)
-        return self.write(json.dumps(data))
-
-    def ndjson_start(self, status=None):
-        if self._ndjson_started:
-            return
-
-        if status is not None:
-            self.set_status(status)
-
-        self.set_header("Content-Type", "application/x-ndjson")
-        self.set_header("Cache-Control", "no-cache, no-transform")
-        self.set_header("Connection", "keep-alive")
-        # If you're behind nginx, this prevents proxy buffering of the stream
-        self.set_header("X-Accel-Buffering", "no")
-        # Ensure we don't send a Content-Length for a streaming response
-        self.set_header("Vary", "Accept")
-        try:
-            self.clear_header("Content-Length")
-        except Exception:
-            pass
-
-        try:
-            self.flush()
-        except Exception:
-            pass
-
-        self._ndjson_started = True
-
-    def ndjson(self, data, status=None):
-        if not self._ndjson_started:
-            self.ndjson_start(status=status)
-
-        self.write(json.dumps(data) + "\n")
-        try:
-            self.flush()
-        except Exception:
-            pass
-        return
-
-    def ndjson_end(self):
-        try:
-            self.finish()
-        except Exception:
-            pass
-
-    def expects_ndjson(self) -> bool:
-        accept = (self.request.headers.get("Accept") or "").lower()
-        return "application/x-ndjson" in accept
+        return self.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
     def options(self, *_args, **_kwargs):
         self.set_status(204)
