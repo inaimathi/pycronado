@@ -151,7 +151,9 @@ class NDJSONMixin:
         except Exception:
             pass
 
-    async def andjson_pump(self, ait: AsyncIterator[Any], status: int = 200) -> None:
+    async def andjson_pump(
+        self, ait: AsyncIterator[Any], status: int = 200, on_error=None
+    ) -> None:
         """Stream an asynchronous iterator into the response."""
         await self.andjson_start(status)
         try:
