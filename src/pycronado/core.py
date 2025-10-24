@@ -6,7 +6,7 @@ import mimetypes
 import os
 import re
 from asyncio import run
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator, Optional
 
 import tornado
 import tornado.iostream
@@ -89,7 +89,12 @@ class NDJSONMixin:
         except Exception:
             pass
 
-    def ndjson_pump(self, it: Iterator[Any], status: int = 200) -> None:
+    def ndjson_pump(
+        self,
+        it: Iterator[Any],
+        status: int = 200,
+        on_error: Optional[Callable[[Exception], Any]] = None,
+    ) -> None:
         """Stream a synchronous iterator into the response."""
         self.ndjson_start(status)
         try:
@@ -105,9 +110,14 @@ class NDJSONMixin:
             finally:
                 self.ndjson_end()
 
-        except Exception:
+        except Exception as e:
             try:
-                self.ndjson({"type": "error", "message": "internal server error"})
+                payload = (
+                    on_error(e)
+                    if on_error
+                    else {"type": "error", "message": "internal server error"}
+                )
+                self.ndjson(payload)
             finally:
                 self.ndjson_end()
 
@@ -152,7 +162,10 @@ class NDJSONMixin:
             pass
 
     async def andjson_pump(
-        self, ait: AsyncIterator[Any], status: int = 200, on_error=None
+        self,
+        ait: AsyncIterator[Any],
+        status: int = 200,
+        on_error: Optional[Callable[[Exception], Any]] = None,
     ) -> None:
         """Stream an asynchronous iterator into the response."""
         await self.andjson_start(status)
