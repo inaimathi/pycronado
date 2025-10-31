@@ -348,8 +348,11 @@ class UserMixin:
     def userId(self):
         return f"{self.issuer()}::{self.username()}"
 
+    def permissions(self):
+        return self.user().get("permissions", [])
+
     def hasPermission(self, ability, group=None):
-        for perm in self.user().get("permissions", []):
+        for perm in self.permissions():
             p_group = perm.get("user_group")
             p_ability = perm.get("group_ability")
 
