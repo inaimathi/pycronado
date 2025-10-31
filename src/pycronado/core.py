@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Callable, Iterator, Optional
 
 import tornado
 import tornado.iostream
+import tornado.web
 
 from . import token
 from .util import getLogger
