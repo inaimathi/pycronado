@@ -2,6 +2,7 @@ import json
 import re
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 
 import fakeredis
 
@@ -114,6 +115,12 @@ class RateLimiter:
                       }
                   )
         """
+        if "max_requests" in counters or "window_seconds" in counters:
+            raise TypeError(
+                "RateLimiter no longer uses `max_requests`/`window_seconds`.\n"
+                "Use tier-based config, e.g. RateLimiter(window='1 day', my_action={"
+                "'tier.free': 5, 'tier.plus': 20, ...})."
+            )
         self.client = client or fakeredis.FakeStrictRedis()
         self.default_window_seconds = _parse_window_to_seconds(window)
         self.tier_priority = tier_priority or list(DEFAULT_TIER_PRIORITY)
@@ -130,7 +137,6 @@ class RateLimiter:
     # ------------------------------------------------------------------------
     # Public configuration surface
     # ------------------------------------------------------------------------
-
     def addCounter(self, action_name, tier_limits, window=None):
         """
         Register or update a metered action.
@@ -154,6 +160,12 @@ class RateLimiter:
             if window is None
             else _parse_window_to_seconds(window)
         )
+
+        if not isinstance(tier_limits, Mapping):
+            raise TypeError(
+                f"tier_limits for action {action_name!r} must be a mapping "
+                f"of tier_name -> limit, got {type(tier_limits).__name__}: {tier_limits!r}"
+            )
 
         self.counters[action_name] = {
             "window_seconds": win,
