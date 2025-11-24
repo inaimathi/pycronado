@@ -1,3 +1,4 @@
+import json
 import re
 import time
 from collections import defaultdict
@@ -60,17 +61,20 @@ class RateLimiter:
       - global god bypass (for *:*), but still accounting usage
       - reporting hooks
 
-    This class:
-      - tracks "counters" (actions) like "audio", "audio_retry", etc.
-      - enforces per-tier quotas per action
-      - exposes @L.limited("audio") for handlers
-      - exposes report() / dumpReport() for introspection/ops
+    Internals:
+      - Uses a Python-implemented token bucket per (user, action):
+          capacity    = limit
+          refill_rate = limit / window_seconds  (tokens per second)
+        where "limit per window" is defined by your tier map and window.
+
+      - Unlimited tiers (limit=None) always pass, but still have their
+        usage counted.
 
     Storage backend:
-      - by default uses fakeredis.FakeStrictRedis(), which is just in-memory
-        for this process (great for dev / single instance)
-      - in production you can pass a real redis.StrictRedis(...)
-        and everything still works the same way across replicas.
+      - By default uses fakeredis.FakeStrictRedis() which lives in-memory
+        for this process (great for dev / simple single-instance setups).
+      - In production you can pass a real redis.StrictRedis-like client.
+        The logic is still pure Python; Redis is just key/value storage.
     """
 
     def __init__(
@@ -88,6 +92,7 @@ class RateLimiter:
               Default is fakeredis.FakeStrictRedis() (in-memory).
             window:
               default window size for counters (e.g. "1 hour" or 3600).
+              Interpreted as: "tier limits are per `window` seconds".
             tier_priority:
               list of tier.* abilities from highest -> lowest.
               Used to pick the "best" tier if the user somehow has multiple.
@@ -168,14 +173,21 @@ class RateLimiter:
                 def post(self, text):
                     ...
 
+        Or with async handlers:
+
+            class SomeHandler(core.JSONHandler, core.NDJSONMixin):
+                @L.limited("job_audit")
+                async def post(self):
+                    ...
+
         Runtime behavior:
-        - Always increments usage for this user/action in the current window.
-        - Checks if usage <= their tier limit.
-        - If they're over limit:
+        - Always records usage for this user/action.
+        - Checks a token bucket for their tier:
+            * capacity     = tier_limit
+            * refill_rate  = tier_limit / window_seconds
+        - If they're over limit (bucket empty):
             - If they're a global god (*:*), ALLOW (but we still counted).
             - Otherwise jsonerr("rate limit exceeded", 429) and stop.
-
-        Either way, this decorator returns/blocks in pycronado style.
         """
 
         def decorator(method):
@@ -209,49 +221,140 @@ class RateLimiter:
     # Internal helpers used by the decorator / counters
     # ------------------------------------------------------------------------
 
-    def _bucket_start(self, window_seconds, now=None):
+    def _redis_key(self, user_id, action_name):
         """
-        Floor current timestamp to the start of this window.
-        For a 1h window, that's the top-of-hour epoch.
-        """
-        if now is None:
-            now = int(time.time())
-        return (now // window_seconds) * window_seconds
-
-    def _redis_key(self, user_id, action_name, bucket_start):
-        """
-        Unique storage key for (user, action, window bucket).
+        Unique storage key for (user, action).
 
         IMPORTANT: user_id includes colons (issuer::username), so we cannot
         safely split on ":" later. We use '|' as a field separator.
 
-        Format:
-            rate|<user_id>|<action_name>|<bucket_start_epoch>
+        Format (token-bucket mode):
+            rate|<user_id>|<action_name>
         """
-        return f"rate|{user_id}|{action_name}|{bucket_start}"
+        return f"rate|{user_id}|{action_name}"
+
+    # -- token bucket state helpers -----------------------------------------
+
+    def _load_bucket_state(self, key):
+        """
+        Load a token-bucket state dict from the backing store.
+
+        Returns:
+            dict(tokens: float, last_update: float, used: int) or None
+        """
+        try:
+            raw = self.client.get(key)
+        except Exception:
+            return None
+
+        if raw is None:
+            return None
+
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+
+        try:
+            state = json.loads(raw)
+        except Exception:
+            return None
+
+        if not isinstance(state, dict):
+            return None
+
+        return state
+
+    def _save_bucket_state(self, key, state, window_seconds):
+        """
+        Persist the given token-bucket state dict to the backing store,
+        with a best-effort TTL to eventually clean up idle users.
+        """
+        # Let the key live for roughly 2 windows of inactivity.
+        ttl = max(int(window_seconds * 2), 60)
+
+        try:
+            payload = json.dumps(state, separators=(",", ":"))
+            self.client.set(key, payload, ex=ttl)
+        except Exception:
+            # If Redis/fakeredis is unavailable, we just drop state changes.
+            # Rate limiting may become more permissive, but we won't crash.
+            pass
 
     def _increment_and_check(self, key, window_seconds, limit):
         """
-        Atomically record usage for this key and decide if it's in quota.
+        Token-bucket based accounting for a single (user, action) key.
 
-        We ALWAYS increment, even if limit is None or the caller is a god.
-        That means:
-          - reporting sees everyone's traffic
-          - unlimited tiers are still measured
-
-        After increment:
-          - if limit is None: always allowed
-          - else: allowed if count_after <= limit
+        Semantics:
+          - For finite limits:
+              * capacity    = limit
+              * refill_rate = limit / window_seconds (tokens/sec)
+              * This method:
+                  - refills the bucket based on elapsed time
+                  - consumes 1 token if available
+                  - increments 'used' (total calls)
+              * Returns True if the token was acquired, False otherwise.
+          - For unlimited (limit is None):
+              * Always allowed.
+              * 'used' is still incremented.
         """
-        pipe = self.client.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, window_seconds)
-        count_after, _ = pipe.execute()
+        now = time.time()
 
+        # Unlimited tier: always allowed, just count usage.
         if limit is None:
+            state = self._load_bucket_state(key) or {}
+            used = int(state.get("used", 0)) + 1
+            state.update(
+                {
+                    "tokens": float("inf"),
+                    "last_update": now,
+                    "used": used,
+                }
+            )
+            self._save_bucket_state(key, state, window_seconds)
             return True
 
-        return int(count_after) <= int(limit)
+        # Finite limit → real token bucket.
+        capacity = int(limit)
+
+        # "No usage" tier: always disallow but still count.
+        if capacity <= 0:
+            state = self._load_bucket_state(key) or {}
+            used = int(state.get("used", 0)) + 1
+            state.update(
+                {
+                    "tokens": 0.0,
+                    "last_update": now,
+                    "used": used,
+                }
+            )
+            self._save_bucket_state(key, state, window_seconds)
+            return False
+
+        # Load existing state or initialize a fresh bucket.
+        state = self._load_bucket_state(key) or {}
+        tokens = float(state.get("tokens", capacity))
+        last_update = float(state.get("last_update", now))
+        used = int(state.get("used", 0))
+
+        # Refill tokens based on elapsed time.
+        delta = max(0.0, now - last_update)
+        rate = float(capacity) / float(window_seconds)  # tokens per second
+        tokens = min(float(capacity), tokens + rate * delta)
+
+        # Try to acquire a token.
+        allowed = tokens >= 1.0
+        if allowed:
+            tokens -= 1.0
+
+        used += 1
+
+        new_state = {
+            "tokens": tokens,
+            "last_update": now,
+            "used": used,
+        }
+        self._save_bucket_state(key, new_state, window_seconds)
+
+        return allowed
 
     def _is_global_admin(self, handler_self):
         """
@@ -310,8 +413,14 @@ class RateLimiter:
 
     def check_and_increment(self, user_id, tier_ability, action_name):
         """
-        Increment usage for this (user, action_name, current window),
-        and return True if usage is still within their tier's quota.
+        Record usage for this (user, action_name) and return True if usage
+        is still within their tier's quota.
+
+        Uses a token-bucket internally:
+
+          - limit = tier-specific limit (calls per `window_seconds`)
+          - capacity = limit
+          - refill_rate = limit / window_seconds (tokens/sec)
 
         If this action_name was never registered with addCounter(), it's not metered:
         we treat it as always allowed and we do NOT create counters for it.
@@ -329,9 +438,7 @@ class RateLimiter:
             tier_limits.get("tier.free", None),
         )
 
-        bucket_start = self._bucket_start(window_seconds)
-        key = self._redis_key(user_id, action_name, bucket_start)
-
+        key = self._redis_key(user_id, action_name)
         return self._increment_and_check(key, window_seconds, limit)
 
     # ------------------------------------------------------------------------
@@ -346,44 +453,48 @@ class RateLimiter:
         Shape:
             {
               "<action_name>": {
-                 "<user_id>": <count_sum_across_live_buckets>,
+                 "<user_id>": <total_used>,
                  ...
               },
               ...
             }
 
         Notes:
-        - We aggregate across all non-expired buckets we can see.
-          (Because of how TTL works, that usually means "this hour",
-           maybe plus a tail from the previous bucket if it hasn't expired yet.)
+        - Under the token-bucket scheme, we aggregate the "used" field for
+          each (user, action) key:
+              rate|<user_id>|<action_name>
         - This is *not* a strict billing ledger. It's an ops/debug snapshot.
         """
         summary = defaultdict(lambda: defaultdict(int))
 
         # fakeredis and redis.StrictRedis both support .keys()
-        for raw_key in self.client.keys("rate|*"):
+        try:
+            keys = self.client.keys("rate|*")
+        except Exception:
+            keys = []
+
+        for raw_key in keys:
             # raw_key may be bytes (redis) or str (fakeredis). Normalize to str.
             if isinstance(raw_key, bytes):
                 raw_key = raw_key.decode("utf-8", "replace")
 
-            # Expect "rate|<user_id>|<action_name>|<bucket_start>"
-            parts = raw_key.split("|", 3)
-            if len(parts) != 4:
+            # Expect "rate|<user_id>|<action_name>"
+            parts = raw_key.split("|", 2)
+            if len(parts) != 3:
                 continue
-            _prefix, user_id, action_name, _bucket = parts
 
-            # fetch current count for that key
-            val = self.client.get(raw_key)
-            if val is None:
+            _prefix, user_id, action_name = parts
+
+            state = self._load_bucket_state(raw_key)
+            if not state:
                 continue
-            if isinstance(val, bytes):
-                val = val.decode("utf-8", "replace")
+
+            used_val = state.get("used")
             try:
-                count = int(val)
-            except ValueError:
+                count = int(used_val)
+            except (TypeError, ValueError):
                 continue
 
-            # aggregate per action then per user
             summary[action_name][user_id] += count
 
         # convert defaultdicts back to plain dicts for cleanliness
