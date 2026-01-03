@@ -5,7 +5,8 @@ import json
 import mimetypes
 import os
 import re
-from asyncio import run
+from asyncio import run  # included for callers as part of the external API
+from datetime import date, datetime, time
 from typing import Any, AsyncIterator, Callable, Iterator, Optional
 
 import tornado
@@ -14,6 +15,12 @@ import tornado.web
 
 from . import token
 from .util import getLogger
+
+
+def date_serializer(obj):
+    if isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def requires(*param_names, permissions=None):
@@ -71,13 +78,8 @@ class NDJSONMixin:
         except Exception:
             pass
 
-    @staticmethod
-    def _encode_line(data: Any) -> str:
-        return (
-            data
-            if isinstance(data, str)
-            else json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        ) + "\n"
+    def _encode_line(self, data: Any) -> str:
+        return (data if isinstance(data, str) else self.dumps(data)) + "\n"
 
     def ndjson_start(self, status: int | None = None) -> None:
         if getattr(self, "_ndjson_started", False):
@@ -310,6 +312,11 @@ class PublicJSONHandler(tornado.web.RequestHandler):
 
         self.finish()
 
+    def dumps(self, data):
+        return json.dumps(
+            data, ensure_ascii=False, separators=(",", ":"), default=date_serializer
+        )
+
     def jsonerr(self, message, status=500):
         self.json({"status": "error", "message": message}, status)
         self.finish()
@@ -317,7 +324,7 @@ class PublicJSONHandler(tornado.web.RequestHandler):
     def json(self, data, status=None):
         if status is not None:
             self.set_status(status)
-        return self.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+        return self.write(self.dumps(data))
 
     def options(self, *_args, **_kwargs):
         self.set_status(204)
