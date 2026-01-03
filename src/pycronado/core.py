@@ -216,6 +216,8 @@ class NDJSONMixin:
 
 
 class PublicJSONHandler(tornado.web.RequestHandler):
+    json_serializer = None
+
     def prepare(self):
         self._logger = None
         self._data = None
@@ -312,9 +314,15 @@ class PublicJSONHandler(tornado.web.RequestHandler):
 
         self.finish()
 
+    def get_json_serializer(self):
+        return getattr(self, "json_serializer", None) or date_serializer
+
     def dumps(self, data):
         return json.dumps(
-            data, ensure_ascii=False, separators=(",", ":"), default=date_serializer
+            data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=self.get_json_serializer(),
         )
 
     def jsonerr(self, message, status=500):
