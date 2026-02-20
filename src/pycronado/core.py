@@ -7,14 +7,15 @@ import os
 import re
 from asyncio import run  # included for callers as part of the external API
 from datetime import date, datetime, time
-from typing import Any, AsyncIterator, Callable, Iterator, Optional
+from typing import Any, AsyncIterator, Callable, Iterator, Optional, Sequence
+from urllib.parse import urlparse
 
 import tornado
 import tornado.iostream
 import tornado.web
 
 from . import token
-from .util import getLogger
+from .util import getLogger, normalize_origin
 
 
 def date_serializer(obj):
@@ -217,14 +218,71 @@ class NDJSONMixin:
 
 class PublicJSONHandler(tornado.web.RequestHandler):
     json_serializer = None
+    origin_whitelist: Optional[Sequence[str]] = None
 
     def prepare(self):
         self._logger = None
         self._data = None
-        # NOTE: no NDJSON flags here; NDJSON state is confined to NDJSONMixin.
-        self.set_header("Access-Control-Allow-Origin", "*")
-        self.set_header("Access-Control-Allow-Headers", "*")
-        self.set_header("Access-Control-Allow-Methods", "*")
+        self._apply_cors()
+
+    def get_origin_whitelist(self) -> Optional[Sequence[str]]:
+        """
+        Override-able hook (mirrors get_json_serializer style).
+
+        - Default: returns self.origin_whitelist
+        - Handlers can override to compute from DB, env, etc.
+        """
+        return getattr(self, "origin_whitelist", None)
+
+    def _apply_cors(self) -> None:
+        wl = self.get_origin_whitelist()
+
+        # Default behavior: allow all (legacy / current behavior)
+        if wl is None:
+            self.set_header("Access-Control-Allow-Origin", "*")
+            self.set_header("Access-Control-Allow-Headers", "*")
+            self.set_header("Access-Control-Allow-Methods", "*")
+            return
+
+        # Whitelist behavior: reflect allowed Origin exactly.
+        req_origin = normalize_origin(self.request.headers.get("Origin"))
+        allowed = {normalize_origin(o) for o in wl}
+        allowed.discard(None)
+
+        if req_origin and req_origin in allowed:
+            self.set_header("Access-Control-Allow-Origin", req_origin)
+            # Credentialed CORS (cookies) requires:
+            # - no '*'
+            # - allow-credentials true
+            self.set_header("Access-Control-Allow-Credentials", "true")
+
+            # Better compatibility: reflect requested headers/method for preflight.
+            req_hdrs = self.request.headers.get("Access-Control-Request-Headers")
+            req_meth = self.request.headers.get("Access-Control-Request-Method")
+            if req_hdrs:
+                self.set_header("Access-Control-Allow-Headers", req_hdrs)
+            else:
+                self.set_header("Access-Control-Allow-Headers", "*")
+            if req_meth:
+                self.set_header("Access-Control-Allow-Methods", req_meth)
+            else:
+                self.set_header("Access-Control-Allow-Methods", "*")
+
+            # Cache correctness when reflecting origins
+            try:
+                self.add_header("Vary", "Origin")
+            except Exception:
+                self.set_header("Vary", "Origin")
+        else:
+            # Disallowed origin: send no CORS allow headers at all.
+            # Browser will block.
+            try:
+                self.clear_header("Access-Control-Allow-Origin")
+                self.clear_header("Access-Control-Allow-Headers")
+                self.clear_header("Access-Control-Allow-Methods")
+                self.clear_header("Access-Control-Allow-Credentials")
+            except Exception:
+                pass
 
     def logger(self):
         if self._logger is None:
