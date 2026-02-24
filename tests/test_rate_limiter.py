@@ -24,7 +24,7 @@ class DummyHandler:
         self.called = 0
         self.last_jsonerr = None
 
-    def userId(self):
+    def user_id(self):
         return self._uid
 
     def permissions(self):
@@ -101,8 +101,8 @@ class RateLimiterTests(unittest.TestCase):
         # including the blocked one.
         rep = limiter.report()
         self.assertIn("audio", rep)
-        self.assertIn(h.userId(), rep["audio"])
-        self.assertEqual(rep["audio"][h.userId()], 3)
+        self.assertIn(h.user_id(), rep["audio"])
+        self.assertEqual(rep["audio"][h.user_id()], 3)
 
     def test_unlimited_tier_allows_but_counts(self):
         """
@@ -137,7 +137,7 @@ class RateLimiterTests(unittest.TestCase):
 
         # Report shows all usage counted
         rep = limiter.report()
-        self.assertEqual(rep["audio"][h.userId()], 3)
+        self.assertEqual(rep["audio"][h.user_id()], 3)
 
     def test_global_admin_bypass_but_counted(self):
         """
@@ -184,7 +184,7 @@ class RateLimiterTests(unittest.TestCase):
         # Accounting should show 3 total invocations
         rep = limiter.report()
         self.assertIn("audio", rep)
-        self.assertEqual(rep["audio"][h.userId()], 3)
+        self.assertEqual(rep["audio"][h.user_id()], 3)
 
     def test_org_admin_is_not_bypassed(self):
         """
@@ -228,7 +228,7 @@ class RateLimiterTests(unittest.TestCase):
         # Accounting still counts both attempts
         rep = limiter.report()
         self.assertIn("audio", rep)
-        self.assertEqual(rep["audio"][h.userId()], 2)
+        self.assertEqual(rep["audio"][h.user_id()], 2)
 
     def test_report(self):
         """
@@ -266,11 +266,11 @@ class RateLimiterTests(unittest.TestCase):
 
         rep = limiter.report()
         self.assertIn("audio", rep)
-        self.assertIn(h_a.userId(), rep["audio"])
-        self.assertIn(h_b.userId(), rep["audio"])
+        self.assertIn(h_a.user_id(), rep["audio"])
+        self.assertIn(h_b.user_id(), rep["audio"])
 
-        self.assertEqual(rep["audio"][h_a.userId()], 2)
-        self.assertEqual(rep["audio"][h_b.userId()], 3)
+        self.assertEqual(rep["audio"][h_a.user_id()], 2)
+        self.assertEqual(rep["audio"][h_b.user_id()], 3)
 
 
 if __name__ == "__main__":
