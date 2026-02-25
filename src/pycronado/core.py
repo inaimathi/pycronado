@@ -6,13 +6,15 @@ import mimetypes
 import os
 import re
 from asyncio import run  # included for callers as part of the external API
+from collections import defaultdict
 from datetime import date, datetime, time
 from typing import Any, AsyncIterator, Callable, Iterator, Optional, Sequence
-from urllib.parse import urlparse
 
 import tornado
+import tornado.ioloop
 import tornado.iostream
 import tornado.web
+import tornado.websocket
 
 from . import token
 from .util import getLogger, normalize_origin
@@ -22,6 +24,26 @@ def date_serializer(obj):
     if isinstance(obj, (datetime, date, time)):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+class JSONSerializationMixin:
+    """
+    Shared JSON serialization behavior for HTTP and WebSocket handlers.
+    Mirrors PublicJSONHandler's serializer override pattern.
+    """
+
+    json_serializer = None
+
+    def get_json_serializer(self):
+        return getattr(self, "json_serializer", None) or date_serializer
+
+    def dumps(self, data):
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=self.get_json_serializer(),
+        )
 
 
 def requires(*param_names, permissions=None):
@@ -45,7 +67,7 @@ def requires(*param_names, permissions=None):
             # --- 2. Enforce permission(s), if requested ---
             if required_perms is not None:
                 has_any = any(
-                    getattr(self, "hasPermission", lambda *_: False)(perm)
+                    getattr(self, "has_permission", lambda *_: False)(perm)
                     for perm in required_perms
                 )
 
@@ -216,8 +238,109 @@ class NDJSONMixin:
             await self.andjson_end()
 
 
-class PublicJSONHandler(tornado.web.RequestHandler):
-    json_serializer = None
+class WebSocketHub:
+    """
+    Process-local websocket pub/sub hub.
+
+    - Tracks subscribers by channel
+    - Safe to publish from any thread
+    - Actual socket writes happen on the Tornado IOLoop thread
+    """
+
+    def __init__(self, ioloop=None):
+        self.ioloop = ioloop or tornado.ioloop.IOLoop.current()
+        self.channels = defaultdict(set)  # channel -> set[BaseChannelSocketHandler]
+
+    def subscribe(self, channel: str, client) -> None:
+        if channel:
+            self.channels[channel].add(client)
+
+    def unsubscribe(self, channel: str, client) -> None:
+        subs = self.channels.get(channel)
+        if not subs:
+            return
+        subs.discard(client)
+        if not subs:
+            self.channels.pop(channel, None)
+
+    def unsubscribe_all(self, client) -> None:
+        for ch in list(getattr(client, "_ws_channels", set())):
+            self.unsubscribe(ch, client)
+        try:
+            client._ws_channels.clear()
+        except Exception:
+            pass
+
+    def publish(self, channel: str, message: Any) -> None:
+        """
+        Thread-safe entrypoint. Can be called from handlers, workers, etc.
+        """
+        if not channel:
+            return
+        self.ioloop.add_callback(self._publish_now, channel, message)
+
+    def broadcast(self, message: Any) -> None:
+        """
+        Thread-safe broadcast to every connected client in every channel.
+        """
+        self.ioloop.add_callback(self._broadcast_now, message)
+
+    def _serialize_for(self, client, message: Any) -> str:
+        # Keep a string passthrough for flexibility, though most usage is JSON objects.
+        if isinstance(message, str):
+            return message
+        dumps = getattr(client, "dumps", None)
+        if callable(dumps):
+            return dumps(message)
+        return json.dumps(
+            message,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=date_serializer,
+        )
+
+    def _publish_now(self, channel: str, message: Any) -> None:
+        for client in list(self.channels.get(channel, ())):
+            try:
+                client.write_message(self._serialize_for(client, message))
+            except tornado.websocket.WebSocketClosedError:
+                self.unsubscribe(channel, client)
+            except Exception:
+                self.unsubscribe(channel, client)
+
+    def _broadcast_now(self, message: Any) -> None:
+        all_clients = set()
+        for subs in self.channels.values():
+            all_clients.update(subs)
+
+        for client in list(all_clients):
+            try:
+                client.write_message(self._serialize_for(client, message))
+            except tornado.websocket.WebSocketClosedError:
+                self.unsubscribe_all(client)
+            except Exception:
+                self.unsubscribe_all(client)
+
+
+_GLOBAL_WS_HUB = None
+
+
+def set_ws_hub(hub: Optional[WebSocketHub]) -> None:
+    global _GLOBAL_WS_HUB
+    _GLOBAL_WS_HUB = hub
+
+
+def get_ws_hub() -> Optional[WebSocketHub]:
+    return _GLOBAL_WS_HUB
+
+
+def publish_ws(channel: str, message: Any) -> None:
+    hub = get_ws_hub()
+    if hub is not None:
+        hub.publish(channel, message)
+
+
+class PublicJSONHandler(JSONSerializationMixin, tornado.web.RequestHandler):
     origin_whitelist: Optional[Sequence[str]] = None
 
     def prepare(self):
@@ -372,17 +495,6 @@ class PublicJSONHandler(tornado.web.RequestHandler):
 
         self.finish()
 
-    def get_json_serializer(self):
-        return getattr(self, "json_serializer", None) or date_serializer
-
-    def dumps(self, data):
-        return json.dumps(
-            data,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=self.get_json_serializer(),
-        )
-
     def jsonerr(self, message, status=500):
         self.json({"status": "error", "message": message}, status)
         self.finish()
@@ -403,29 +515,167 @@ class PublicJSONHandler(tornado.web.RequestHandler):
         return self.json({"status": "TODO", **kwargs}, 501)
 
 
+class BaseChannelSocketHandler(
+    JSONSerializationMixin, tornado.websocket.WebSocketHandler
+):
+    """
+    Base channel-based websocket handler with pub/sub support.
+
+    Route examples:
+      (r"/ws/([^/]+)", PublicChannelSocketHandler)   # channel from path
+      (r"/ws", PublicChannelSocketHandler)           # channel via ?channel=foo
+
+    Supports optional subscribe/unsubscribe messages from client:
+      {"action":"subscribe","channel":"jobs"}
+      {"action":"unsubscribe","channel":"jobs"}
+      {"action":"ping"}
+    """
+
+    origin_whitelist: Optional[Sequence[str]] = None
+
+    # ---- helpers ----
+
+    def get_origin_whitelist(self) -> Optional[Sequence[str]]:
+        return getattr(self, "origin_whitelist", None)
+
+    def _hub(self) -> WebSocketHub:
+        hub = getattr(self.application, "ws_hub", None)
+        if hub is None:
+            raise RuntimeError("Application has no ws_hub (start(..., websocket=True))")
+        return hub
+
+    def write_json(self, data: Any) -> None:
+        self.write_message(self.dumps(data))
+
+    def parse_json(self, raw: str) -> Optional[dict]:
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    # ---- security ----
+    # Note: WebSockets use origin checks, not CORS headers.
+
+    def check_origin(self, origin: str) -> bool:
+        wl = self.get_origin_whitelist()
+        if wl is None:
+            return True  # legacy allow-all behavior
+
+        req_origin = normalize_origin(origin)
+        allowed = {normalize_origin(o) for o in wl}
+        allowed.discard(None)
+        return req_origin in allowed
+
+    # ---- auth/subscription hooks (override in subclasses) ----
+
+    def can_connect(self) -> bool:
+        return True
+
+    def can_subscribe(self, channel: str) -> bool:
+        return True
+
+    def on_auth_failure(self) -> None:
+        self.close(code=4001, reason="forbidden")
+
+    # ---- lifecycle ----
+
+    def open(self, channel: Optional[str] = None):
+        self._ws_channels = set()
+
+        if not self.can_connect():
+            return self.on_auth_failure()
+
+        ch = channel or self.get_argument("channel", "default")
+        self._subscribe(ch, notify=False)
+        self.write_json({"type": "ready", "channels": [ch]})
+
+    def on_message(self, message):
+        payload = self.parse_json(message)
+        if payload is None:
+            return
+
+        action = payload.get("action")
+        channel = payload.get("channel")
+
+        if action == "ping":
+            self.write_json({"type": "pong"})
+            return
+
+        if action == "subscribe" and isinstance(channel, str):
+            self._subscribe(channel, notify=True)
+            return
+
+        if action == "unsubscribe" and isinstance(channel, str):
+            self._unsubscribe(channel, notify=True)
+            return
+
+    def on_close(self):
+        try:
+            self._hub().unsubscribe_all(self)
+        except Exception:
+            pass
+
+    # ---- subscription ops ----
+
+    def _subscribe(self, channel: str, notify: bool = True) -> None:
+        if not channel:
+            return
+        if not self.can_subscribe(channel):
+            if notify:
+                self.write_json(
+                    {"type": "error", "message": "forbidden", "channel": channel}
+                )
+            return
+
+        self._hub().subscribe(channel, self)
+        self._ws_channels.add(channel)
+
+        if notify:
+            self.write_json({"type": "subscribed", "channel": channel})
+
+    def _unsubscribe(self, channel: str, notify: bool = True) -> None:
+        if not channel:
+            return
+
+        self._hub().unsubscribe(channel, self)
+        self._ws_channels.discard(channel)
+
+        if notify:
+            self.write_json({"type": "unsubscribed", "channel": channel})
+
+
+class PublicChannelSocketHandler(BaseChannelSocketHandler):
+    """
+    Public websocket handler (no auth required).
+    """
+
+    pass
+
+
 class UserMixin:
     def token(self):
         if not hasattr(self, "JWT"):
-            self.JWT = self.decodedJwt()
+            self.JWT = self.decoded_jwt()
         return self.JWT
 
     def issuer(self):
-        return self.decodedJwt()["iss"]
+        return self.decoded_jwt()["iss"]
 
     def user(self):
-        jwt = self.decodedJwt()
+        jwt = self.decoded_jwt()
         return jwt["user"]
 
     def username(self):
         return self.user()["username"]
 
-    def userId(self):
+    def user_id(self):
         return f"{self.issuer()}::{self.username()}"
 
     def permissions(self):
         return self.user().get("permissions", [])
 
-    def hasPermission(self, ability, group=None):
+    def has_permission(self, ability, group=None):
         for perm in self.permissions():
             p_group = perm.get("user_group")
             p_ability = perm.get("group_ability")
@@ -443,6 +693,54 @@ class UserMixin:
         return False
 
 
+class ChannelSocketHandler(BaseChannelSocketHandler, UserMixin):
+    """
+    Authenticated websocket handler (WS equivalent of JSONHandler).
+
+    Token sources (in order):
+      1) Authorization: Bearer ...
+      2) ?jwt=...                      (browser-friendly but can leak in logs)
+      3) Cookie (if ws_jwt_cookie_name is set)
+    """
+
+    ws_jwt_query_param = "jwt"
+    ws_jwt_cookie_name = None  # set in subclass if you want cookie-based auth
+
+    def jwt(self):
+        auth_header = self.request.headers.get("Authorization")
+        if auth_header:
+            return re.sub("^Bearer +", "", auth_header)
+
+        qname = getattr(self, "ws_jwt_query_param", "jwt")
+        if qname:
+            qjwt = self.get_argument(qname, None)
+            if qjwt:
+                return qjwt
+
+        cname = getattr(self, "ws_jwt_cookie_name", None)
+        if cname:
+            cval = self.get_cookie(cname)
+            if cval:
+                return cval
+
+        return None
+
+    def decoded_jwt(self):
+        if hasattr(self, "JWT"):
+            return self.JWT
+        return token.decode(self.jwt())
+
+    def can_connect(self) -> bool:
+        raw = self.jwt()
+        if raw is None:
+            return False
+        try:
+            self.JWT = token.decode(raw)
+            return True
+        except Exception:
+            return False
+
+
 class JSONHandler(PublicJSONHandler, UserMixin):
     def prepare(self):
         super().prepare()
@@ -455,14 +753,16 @@ class JSONHandler(PublicJSONHandler, UserMixin):
             self.finish()
             return
         try:
-            token.decode(self.jwt())
+            self.JWT = token.decode(self.jwt())
         except Exception:
             self.json({"status": "error", "message": "forbidden"}, 403)
             self.finish()
             return
 
-    def decodedJwt(self):
-        return token.decode(self.jwt())
+    def decoded_jwt(self):
+        if not hasattr(self, "JWT"):
+            self.JWT = token.decode(self.jwt())
+        return self.JWT
 
 
 class Default404Handler(PublicJSONHandler):
@@ -489,9 +789,12 @@ async def start(
     static_url_prefix=None,
     default_handler_class=None,
     debug=False,
+    websocket=False,
+    max_body_size=None,
 ):
     if default_handler_class is None:
         default_handler_class = Default404Handler
+
     app = tornado.web.Application(
         routes,
         default_handler_class=default_handler_class,
@@ -500,6 +803,18 @@ async def start(
         static_url_prefix=static_url_prefix,
     )
     app.logger = getLogger(name)
+
+    # Optional websocket infrastructure
+    app.ws_hub = None
+    if websocket:
+        app.ws_hub = WebSocketHub(ioloop=tornado.ioloop.IOLoop.current())
+        set_ws_hub(app.ws_hub)
+    else:
+        set_ws_hub(None)
+
     app.logger.info(f"  listening on {port}...")
-    app.listen(int(port))
+    listen_kwargs = {}
+    if max_body_size is not None:
+        listen_kwargs["max_body_size"] = int(max_body_size)
+    app.listen(int(port), **listen_kwargs)
     await asyncio.Event().wait()

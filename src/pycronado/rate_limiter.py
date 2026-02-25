@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import json
 import re
 import time
@@ -12,6 +14,11 @@ DEFAULT_TIER_PRIORITY = [
     "tier.plus",
     "tier.free",
 ]
+
+# Sentinel stored in Redis to represent an unlimited tier bucket.
+# We avoid float("inf") because it serialises to `Infinity`, which is not
+# valid JSON and breaks non-Python consumers (Redis CLI, log aggregators, etc.).
+_UNLIMITED_SENTINEL = -1
 
 
 def _parse_window_to_seconds(window):
@@ -45,6 +52,12 @@ def _parse_window_to_seconds(window):
 
     if unit.startswith("s"):
         return num
+    # "mo" / "month" must be checked before plain "m" (minutes)
+    if unit.startswith("mo"):
+        raise ValueError(
+            f"Month-based windows are ambiguous; use explicit days instead "
+            f"(e.g. '30 days') in window spec {window!r}"
+        )
     if unit.startswith("m"):
         return num * 60
     if unit.startswith("h"):
@@ -76,6 +89,13 @@ class RateLimiter:
         for this process (great for dev / simple single-instance setups).
       - In production you can pass a real redis.StrictRedis-like client.
         The logic is still pure Python; Redis is just key/value storage.
+
+    Concurrency note:
+      - The load/modify/save cycle in _increment_and_check is NOT atomic.
+        Under high concurrency, two requests for the same user can race and
+        both see tokens available. For strict enforcement at scale, replace
+        _increment_and_check with a Redis Lua script (EVAL) so the
+        check-and-decrement is atomic server-side.
     """
 
     def __init__(
@@ -132,12 +152,12 @@ class RateLimiter:
         # }
         self.counters = {}
         for action_name, tier_map in counters.items():
-            self.addCounter(action_name, tier_map, window=None)
+            self.add_counter(action_name, tier_map, window=None)
 
     # ------------------------------------------------------------------------
     # Public configuration surface
     # ------------------------------------------------------------------------
-    def addCounter(self, action_name, tier_limits, window=None):
+    def add_counter(self, action_name, tier_limits, window=None):
         """
         Register or update a metered action.
 
@@ -176,6 +196,8 @@ class RateLimiter:
         """
         Decorator that enforces per-user quota for `action_name`.
 
+        Works with both synchronous and asynchronous handler methods.
+
         Usage in a handler:
 
             L = RateLimiter(..., audio={...})
@@ -203,29 +225,39 @@ class RateLimiter:
         """
 
         def decorator(method):
-            def wrapper(handler_self, *args, **kwargs):
-                # figure out if they're a global god (*:*)
+            def _enforce(handler_self):
+                """
+                Shared prelude: check quota, return True if the request should
+                be blocked (i.e. caller should return the jsonerr result).
+                """
                 admin = self._is_global_admin(handler_self)
-
-                # pick their best tier.* (tier.power > tier.premium > ...)
                 tier_ability = self._get_highest_tier(handler_self)
-
-                # record usage and see if they'd normally be allowed
-                user_id = handler_self.userId()
-                allowed = self.check_and_increment(
-                    user_id,
-                    tier_ability,
-                    action_name,
-                )
+                user_id = handler_self.user_id()
+                allowed = self.check_and_increment(user_id, tier_ability, action_name)
 
                 if not allowed and not admin:
-                    # normal user over quota → block
-                    return handler_self.jsonerr("rate limit exceeded", 429)
+                    return True  # blocked
+                return False  # allowed
 
-                # either allowed, or admin override → proceed
-                return method(handler_self, *args, **kwargs)
+            if asyncio.iscoroutinefunction(method):
 
-            return wrapper
+                @functools.wraps(method)
+                async def async_wrapper(handler_self, *args, **kwargs):
+                    if _enforce(handler_self):
+                        return handler_self.jsonerr("rate limit exceeded", 429)
+                    return await method(handler_self, *args, **kwargs)
+
+                return async_wrapper
+
+            else:
+
+                @functools.wraps(method)
+                def sync_wrapper(handler_self, *args, **kwargs):
+                    if _enforce(handler_self):
+                        return handler_self.jsonerr("rate limit exceeded", 429)
+                    return method(handler_self, *args, **kwargs)
+
+                return sync_wrapper
 
         return decorator
 
@@ -307,6 +339,8 @@ class RateLimiter:
           - For unlimited (limit is None):
               * Always allowed.
               * 'used' is still incremented.
+
+        Note: this read-modify-write is not atomic. See class docstring.
         """
         now = time.time()
 
@@ -316,7 +350,7 @@ class RateLimiter:
             used = int(state.get("used", 0)) + 1
             state.update(
                 {
-                    "tokens": float("inf"),
+                    "tokens": _UNLIMITED_SENTINEL,
                     "last_update": now,
                     "used": used,
                 }
@@ -343,7 +377,9 @@ class RateLimiter:
 
         # Load existing state or initialize a fresh bucket.
         state = self._load_bucket_state(key) or {}
-        tokens = float(state.get("tokens", capacity))
+        raw_tokens = state.get("tokens", capacity)
+        # Treat the unlimited sentinel as a full bucket if the tier changed.
+        tokens = float(capacity if raw_tokens == _UNLIMITED_SENTINEL else raw_tokens)
         last_update = float(state.get("last_update", now))
         used = int(state.get("used", 0))
 
@@ -434,7 +470,7 @@ class RateLimiter:
           - capacity = limit
           - refill_rate = limit / window_seconds (tokens/sec)
 
-        If this action_name was never registered with addCounter(), it's not metered:
+        If this action_name was never registered with add_counter(), it's not metered:
         we treat it as always allowed and we do NOT create counters for it.
         """
         cfg = self.counters.get(action_name)
@@ -476,42 +512,43 @@ class RateLimiter:
           each (user, action) key:
               rate|<user_id>|<action_name>
         - This is *not* a strict billing ledger. It's an ops/debug snapshot.
+        - Uses SCAN rather than KEYS to avoid blocking Redis on large keyspaces.
         """
         summary = defaultdict(lambda: defaultdict(int))
 
-        # fakeredis and redis.StrictRedis both support .keys()
         try:
-            keys = self.client.keys("rate|*")
+            # SCAN iterates incrementally; safe on large keyspaces unlike KEYS.
+            cursor = 0
+            while True:
+                cursor, keys = self.client.scan(cursor, match="rate|*", count=100)
+                for raw_key in keys:
+                    if isinstance(raw_key, bytes):
+                        raw_key = raw_key.decode("utf-8", "replace")
+
+                    # Expect "rate|<user_id>|<action_name>"
+                    parts = raw_key.split("|", 2)
+                    if len(parts) != 3:
+                        continue
+
+                    _prefix, user_id, action_name = parts
+
+                    state = self._load_bucket_state(raw_key)
+                    if not state:
+                        continue
+
+                    used_val = state.get("used")
+                    try:
+                        count = int(used_val)
+                    except (TypeError, ValueError):
+                        continue
+
+                    summary[action_name][user_id] += count
+
+                if cursor == 0:
+                    break
+
         except Exception:
-            keys = []
-
-        for raw_key in keys:
-            # raw_key may be bytes (redis) or str (fakeredis). Normalize to str.
-            if isinstance(raw_key, bytes):
-                raw_key = raw_key.decode("utf-8", "replace")
-
-            # Expect "rate|<user_id>|<action_name>"
-            parts = raw_key.split("|", 2)
-            if len(parts) != 3:
-                continue
-
-            _prefix, user_id, action_name = parts
-
-            state = self._load_bucket_state(raw_key)
-            if not state:
-                continue
-
-            used_val = state.get("used")
-            try:
-                count = int(used_val)
-            except (TypeError, ValueError):
-                continue
-
-            summary[action_name][user_id] += count
+            pass
 
         # convert defaultdicts back to plain dicts for cleanliness
-        outer = {}
-        for action_name, users_map in summary.items():
-            outer[action_name] = dict(users_map)
-
-        return outer
+        return {action: dict(users) for action, users in summary.items()}
