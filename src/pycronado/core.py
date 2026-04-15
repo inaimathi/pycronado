@@ -46,6 +46,55 @@ class JSONSerializationMixin:
         )
 
 
+class _CallableLogger:
+    """
+    Thin proxy around a stdlib logger so that both call styles work:
+
+        self.logger.info(...)   # property-style (preferred)
+        self.logger().info(...) # legacy call-style
+    """
+
+    __slots__ = ("_log",)
+
+    def __init__(self, log):
+        self._log = log
+
+    def __call__(self):
+        return self._log
+
+    def __getattr__(self, name):
+        return getattr(self._log, name)
+
+    def __repr__(self):
+        return repr(self._log)
+
+
+class LoggerMixin:
+    """
+    Provides ``self.logger`` (and the legacy ``self.logger()``) backed by a
+    lazily-created, per-instance stdlib logger.
+
+    The name is derived from ``self.request.uri`` when available (HTTP/WS
+    handlers) and falls back to the class name otherwise (e.g. WebSocketHub).
+
+    Call ``self._reset_logger()`` in ``prepare()`` so the name is refreshed
+    for each new request.
+    """
+
+    def _reset_logger(self) -> None:
+        self.__dict__.pop("_logger_proxy", None)
+
+    @property
+    def logger(self) -> _CallableLogger:
+        proxy = self.__dict__.get("_logger_proxy")
+        if proxy is None:
+            uri = getattr(getattr(self, "request", None), "uri", None)
+            name = f"handler:{uri}" if uri else type(self).__name__
+            proxy = _CallableLogger(getLogger(name))
+            self.__dict__["_logger_proxy"] = proxy
+        return proxy
+
+
 def requires(*param_names, permissions=None):
     # normalize permissions into a list so we can iterate uniformly
     if permissions is None:
@@ -238,7 +287,7 @@ class NDJSONMixin:
             await self.andjson_end()
 
 
-class WebSocketHub:
+class WebSocketHub(LoggerMixin):
     """
     Process-local websocket pub/sub hub.
 
@@ -248,14 +297,8 @@ class WebSocketHub:
     """
 
     def __init__(self, ioloop=None):
-        self._logger = None
         self.ioloop = ioloop or tornado.ioloop.IOLoop.current()
         self.channels = defaultdict(set)  # channel -> set[BaseChannelSocketHandler]
-
-    def logger(self):
-        if self._logger is None:
-            self._logger = getLogger(f"handler:{self.request.uri}")
-        return self._logger
 
     def subscribe(self, channel: str, client) -> None:
         if channel:
@@ -346,11 +389,13 @@ def publish_ws(channel: str, message: Any) -> None:
         hub.publish(channel, message)
 
 
-class PublicJSONHandler(JSONSerializationMixin, tornado.web.RequestHandler):
+class PublicJSONHandler(
+    LoggerMixin, JSONSerializationMixin, tornado.web.RequestHandler
+):
     origin_whitelist: Optional[Sequence[str]] = None
 
     def prepare(self):
-        self._logger = None
+        self._reset_logger()
         self._data = None
         self._apply_cors()
 
@@ -412,11 +457,6 @@ class PublicJSONHandler(JSONSerializationMixin, tornado.web.RequestHandler):
                 self.clear_header("Access-Control-Allow-Credentials")
             except Exception:
                 pass
-
-    def logger(self):
-        if self._logger is None:
-            self._logger = getLogger(f"handler:{self.request.uri}")
-        return self._logger
 
     def set_default_headers(self):
         self.set_header("Content-Type", "application/json")
@@ -522,7 +562,7 @@ class PublicJSONHandler(JSONSerializationMixin, tornado.web.RequestHandler):
 
 
 class BaseChannelSocketHandler(
-    JSONSerializationMixin, tornado.websocket.WebSocketHandler
+    LoggerMixin, JSONSerializationMixin, tornado.websocket.WebSocketHandler
 ):
     """
     Base channel-based websocket handler with pub/sub support.
