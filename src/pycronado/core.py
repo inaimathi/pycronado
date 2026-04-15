@@ -1,4 +1,4 @@
-# pycronado/core.py
+# src/pycronado/core.py
 
 import asyncio
 import json
@@ -248,8 +248,14 @@ class WebSocketHub:
     """
 
     def __init__(self, ioloop=None):
+        self._logger = None
         self.ioloop = ioloop or tornado.ioloop.IOLoop.current()
         self.channels = defaultdict(set)  # channel -> set[BaseChannelSocketHandler]
+
+    def logger(self):
+        if self._logger is None:
+            self._logger = getLogger(f"handler:{self.request.uri}")
+        return self._logger
 
     def subscribe(self, channel: str, client) -> None:
         if channel:
