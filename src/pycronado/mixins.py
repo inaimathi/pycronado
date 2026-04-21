@@ -56,8 +56,8 @@ class LoggerMixin:
     def logger(self) -> _CallableLogger:
         proxy = self.__dict__.get("_logger_proxy")
         if proxy is None:
-            uri = getattr(getattr(self, "request", None), "uri", None)
-            name = f"handler:{uri}" if uri else type(self).__name__
+            path = getattr(getattr(self, "request", None), "path", None)
+            name = f"handler:{path}" if path else type(self).__name__
             from .util import getLogger
 
             proxy = _CallableLogger(getLogger(name))
