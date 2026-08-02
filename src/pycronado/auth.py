@@ -2,6 +2,8 @@
 import asyncio
 import functools
 
+# src/pycronado/auth.py
+
 
 def requires(*param_names, permissions=None):
     if permissions is None:
@@ -12,46 +14,58 @@ def requires(*param_names, permissions=None):
         required_perms = [permissions]
 
     def decorator(method):
-        def _check(self, args, kwargs):
+        def _check(self, kwargs):
             for param_name in param_names:
                 value = self.param(param_name)
+
                 if value is None:
-                    return (
-                        self.jsonerr(f"`{param_name}` parameter is required", 400),
-                        kwargs,
+                    self.jsonerr(
+                        f"`{param_name}` parameter is required",
+                        400,
                     )
+                    return False, kwargs
+
                 kwargs[param_name] = value
 
             if required_perms is not None:
                 has_any = any(
-                    getattr(self, "has_permission", lambda *_: False)(perm)
-                    for perm in required_perms
+                    getattr(
+                        self,
+                        "has_permission",
+                        lambda *_args, **_kwargs: False,
+                    )(permission)
+                    for permission in required_perms
                 )
-                if not has_any:
-                    return self.jsonerr("forbidden", 403), kwargs
 
-            return None, kwargs
+                if not has_any:
+                    self.jsonerr("forbidden", 403)
+                    return False, kwargs
+
+            return True, kwargs
 
         if asyncio.iscoroutinefunction(method):
 
             @functools.wraps(method)
             async def async_wrapper(self, *args, **kwargs):
-                err, kwargs = _check(self, args, kwargs)
-                if err is not None:
-                    return err
+                allowed, kwargs = _check(self, kwargs)
+
+                if not allowed:
+                    return None
+
                 return await method(self, *args, **kwargs)
 
             return async_wrapper
-        else:
 
-            @functools.wraps(method)
-            def sync_wrapper(self, *args, **kwargs):
-                err, kwargs = _check(self, args, kwargs)
-                if err is not None:
-                    return err
-                return method(self, *args, **kwargs)
+        @functools.wraps(method)
+        def sync_wrapper(self, *args, **kwargs):
+            allowed, kwargs = _check(self, kwargs)
 
-            return sync_wrapper
+            if not allowed:
+                return None
+
+            return method(self, *args, **kwargs)
+
+        return sync_wrapper
 
     return decorator
 

@@ -13,11 +13,12 @@ import tornado.web
 
 from . import token
 from .auth import UserMixin, requires  # noqa: F401
-from .mixins import (JSONSerializationMixin, LoggerMixin,  # noqa: F401
-                     NDJSONMixin, _CallableLogger, date_serializer)
+from .mixins import LoggerMixin  # noqa: F401
+from .mixins import (JSONSerializationMixin, NDJSONMixin, _CallableLogger,
+                     date_serializer)
 from .util import getLogger, normalize_origin
-from .websocket import (BaseChannelSocketHandler,  # noqa: F401
-                        ChannelSocketHandler, PublicChannelSocketHandler,
+from .websocket import BaseChannelSocketHandler  # noqa: F401
+from .websocket import (ChannelSocketHandler, PublicChannelSocketHandler,
                         WebSocketHub, get_ws_hub, publish_ws, set_ws_hub)
 
 
@@ -195,14 +196,41 @@ class JSONHandler(PublicJSONHandler, UserMixin):
         if self.request.method == "OPTIONS":
             return
 
-        if self.jwt() is None:
-            self.json({"status": "error", "message": "forbidden"}, 403)
+        raw_jwt = self.jwt()
+
+        if raw_jwt is None:
+            # Usually not worth a warning: unauthenticated requests are common.
+            self.logger.debug(
+                "Authentication rejected: missing JWT method=%s uri=%s",
+                self.request.method,
+                self.request.uri,
+            )
+            self.json(
+                {
+                    "status": "error",
+                    "message": "forbidden",
+                },
+                403,
+            )
             self.finish()
             return
+
         try:
-            self.JWT = token.decode(self.jwt())
+            self.JWT = token.decode(raw_jwt)
         except Exception:
-            self.json({"status": "error", "message": "forbidden"}, 403)
+            # Logs the exception and traceback, but not the raw token.
+            self.logger.exception(
+                "Authentication rejected: JWT decode failed " "method=%s uri=%s",
+                self.request.method,
+                self.request.uri,
+            )
+            self.json(
+                {
+                    "status": "error",
+                    "message": "forbidden",
+                },
+                403,
+            )
             self.finish()
             return
 
