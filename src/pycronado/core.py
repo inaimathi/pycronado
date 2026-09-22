@@ -7,8 +7,10 @@ import os
 import re
 from asyncio import run  # noqa: F401 – re-exported as part of the public API
 from typing import Optional, Sequence
+from urllib.parse import quote
 
 import tornado.ioloop
+import tornado.iostream
 import tornado.web
 
 from . import token
@@ -20,6 +22,13 @@ from .util import getLogger, normalize_origin
 from .websocket import BaseChannelSocketHandler  # noqa: F401
 from .websocket import (ChannelSocketHandler, PublicChannelSocketHandler,
                         WebSocketHub, get_ws_hub, publish_ws, set_ws_hub)
+
+
+def _content_disposition(filename, disposition="attachment"):
+    ascii_name = re.sub(r'[^\x20-\x7e]|["\\]', "_", filename)
+    return (
+        f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+    )
 
 
 class PublicJSONHandler(
@@ -149,6 +158,33 @@ class PublicJSONHandler(
                 self.write(chunk)
                 self.flush()
 
+        self.finish()
+
+    async def afile(self, fpath, mimetype=None, filename=None, chunk_size=256 * 1024):
+        """
+        Streaming counterpart to file(). Awaits each flush, so memory stays at
+        ~one chunk and other requests keep being served during a large send.
+        Stops quietly if the client disconnects.
+        """
+        assert os.path.isfile(fpath), f"Path {fpath} is not a file"
+        if mimetype is None:
+            mimetype = mimetypes.guess_type(fpath)[0]
+        assert mimetype, f"Could not infer mimetype of {fpath} and no default provided"
+
+        self.set_header("Content-Type", mimetype)
+        self.set_header("Content-Length", os.path.getsize(fpath))
+        if filename:
+            self.set_header("Content-Disposition", _content_disposition(filename))
+        try:
+            with open(fpath, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    self.write(chunk)
+                    await self.flush()
+        except tornado.iostream.StreamClosedError:
+            return
         self.finish()
 
     def filebytes(self, data, mimetype=None, extension=None):
