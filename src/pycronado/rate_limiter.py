@@ -1,13 +1,11 @@
 # src/pycronado/rate_limiter.py
 import asyncio
 import functools
-import json
 import re
-import time
 from collections import defaultdict
 from collections.abc import Mapping
 
-import fakeredis
+from .buckets import BucketUnavailable, MemoryBucketStore, RedisBucketStore
 
 DEFAULT_TIER_PRIORITY = [
     "tier.power",
@@ -15,12 +13,6 @@ DEFAULT_TIER_PRIORITY = [
     "tier.plus",
     "tier.free",
 ]
-
-# Sentinel stored in Redis to represent an unlimited tier bucket.
-# We avoid float("inf") because it serialises to `Infinity`, which is not
-# valid JSON and breaks non-Python consumers (Redis CLI, log aggregators, etc.).
-_UNLIMITED_SENTINEL = -1
-
 
 def _parse_window_to_seconds(window):
     """
@@ -70,33 +62,12 @@ def _parse_window_to_seconds(window):
 
 
 class RateLimiter:
-    """
-    Per-user, per-action, per-window rate limiter with:
-      - tier-based limits
-      - global god bypass (for *:*), but still accounting usage
-      - reporting hooks
+    """Tier-based quotas with atomic local buckets by default.
 
-    Internals:
-      - Uses a Python-implemented token bucket per (user, action):
-          capacity    = limit
-          refill_rate = limit / window_seconds  (tokens per second)
-        where "limit per window" is defined by your tier map and window.
-
-      - Unlimited tiers (limit=None) always pass, but still have their
-        usage counted.
-
-    Storage backend:
-      - By default uses fakeredis.FakeStrictRedis() which lives in-memory
-        for this process (great for dev / simple single-instance setups).
-      - In production you can pass a real redis.StrictRedis-like client.
-        The logic is still pure Python; Redis is just key/value storage.
-
-    Concurrency note:
-      - The load/modify/save cycle in _increment_and_check is NOT atomic.
-        Under high concurrency, two requests for the same user can race and
-        both see tokens available. For strict enforcement at scale, replace
-        _increment_and_check with a Redis Lua script (EVAL) so the
-        check-and-decrement is atomic server-side.
+    Pass client=<synchronous redis-py client> for shared Redis/Lua buckets.
+    Local buckets are process-local and reset on restart. Storage failures deny
+    work with 503; exhausted buckets return 429. Unregistered actions remain
+    intentionally unmetered. has_permission semantics are unchanged.
     """
 
     def __init__(
@@ -105,13 +76,14 @@ class RateLimiter:
         window="1 hour",
         tier_priority=None,
         org_group="coherentvolition",
+        backend=None,
         **counters,
     ):
         """
         Args:
             client:
               redis-like client (StrictRedis, fakeredis).
-              Default is fakeredis.FakeStrictRedis() (in-memory).
+              Default is an atomic MemoryBucketStore (process-local).
             window:
               default window size for counters (e.g. "1 hour" or 3600).
               Interpreted as: "tier limits are per `window` seconds".
@@ -142,8 +114,13 @@ class RateLimiter:
                 "Use tier-based config, e.g. RateLimiter(window='1 day', my_action={"
                 "'tier.free': 5, 'tier.plus': 20, ...})."
             )
-        self.client = client or fakeredis.FakeStrictRedis()
+        if backend is not None and client is not None:
+            raise ValueError("Pass backend or client, not both")
+        self.backend = backend if backend is not None else (RedisBucketStore(client) if client is not None else MemoryBucketStore())
+        self.client = client
         self.default_window_seconds = _parse_window_to_seconds(window)
+        if self.default_window_seconds <= 0:
+            raise ValueError("Rate-limit window must be positive")
         self.tier_priority = tier_priority or list(DEFAULT_TIER_PRIORITY)
         self.org_group = org_group
 
@@ -188,6 +165,10 @@ class RateLimiter:
                 f"of tier_name -> limit, got {type(tier_limits).__name__}: {tier_limits!r}"
             )
 
+        if win <= 0:
+            raise ValueError("Rate-limit window must be positive")
+        if not tier_limits or any(v is not None and (type(v) is not int or v < 0) for v in tier_limits.values()):
+            raise ValueError("Tier limits must be nonnegative integers or None")
         self.counters[action_name] = {
             "window_seconds": win,
             "tiers": dict(tier_limits),
@@ -244,7 +225,11 @@ class RateLimiter:
 
                 @functools.wraps(method)
                 async def async_wrapper(handler_self, *args, **kwargs):
-                    if _enforce(handler_self):
+                    try:
+                        blocked = await asyncio.to_thread(_enforce, handler_self) if isinstance(self.backend, RedisBucketStore) else _enforce(handler_self)
+                    except BucketUnavailable:
+                        return handler_self.jsonerr("rate limiter unavailable", 503)
+                    if blocked:
                         return handler_self.jsonerr("rate limit exceeded", 429)
                     return await method(handler_self, *args, **kwargs)
 
@@ -254,7 +239,11 @@ class RateLimiter:
 
                 @functools.wraps(method)
                 def sync_wrapper(handler_self, *args, **kwargs):
-                    if _enforce(handler_self):
+                    try:
+                        blocked = _enforce(handler_self)
+                    except BucketUnavailable:
+                        return handler_self.jsonerr("rate limiter unavailable", 503)
+                    if blocked:
                         return handler_self.jsonerr("rate limit exceeded", 429)
                     return method(handler_self, *args, **kwargs)
 
@@ -277,133 +266,6 @@ class RateLimiter:
             rate|<user_id>|<action_name>
         """
         return f"rate|{user_id}|{action_name}"
-
-    # -- token bucket state helpers -----------------------------------------
-
-    def _load_bucket_state(self, key):
-        """
-        Load a token-bucket state dict from the backing store.
-
-        Returns:
-            dict(tokens: float, last_update: float, used: int) or None
-        """
-        try:
-            raw = self.client.get(key)
-        except Exception:
-            return None
-
-        if raw is None:
-            return None
-
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", "replace")
-
-        try:
-            state = json.loads(raw)
-        except Exception:
-            return None
-
-        if not isinstance(state, dict):
-            return None
-
-        return state
-
-    def _save_bucket_state(self, key, state, window_seconds):
-        """
-        Persist the given token-bucket state dict to the backing store,
-        with a best-effort TTL to eventually clean up idle users.
-        """
-        # Let the key live for roughly 2 windows of inactivity.
-        ttl = max(int(window_seconds * 2), 60)
-
-        try:
-            payload = json.dumps(state, separators=(",", ":"))
-            self.client.set(key, payload, ex=ttl)
-        except Exception:
-            # If Redis/fakeredis is unavailable, we just drop state changes.
-            # Rate limiting may become more permissive, but we won't crash.
-            pass
-
-    def _increment_and_check(self, key, window_seconds, limit):
-        """
-        Token-bucket based accounting for a single (user, action) key.
-
-        Semantics:
-          - For finite limits:
-              * capacity    = limit
-              * refill_rate = limit / window_seconds (tokens/sec)
-              * This method:
-                  - refills the bucket based on elapsed time
-                  - consumes 1 token if available
-                  - increments 'used' (total calls)
-              * Returns True if the token was acquired, False otherwise.
-          - For unlimited (limit is None):
-              * Always allowed.
-              * 'used' is still incremented.
-
-        Note: this read-modify-write is not atomic. See class docstring.
-        """
-        now = time.time()
-
-        # Unlimited tier: always allowed, just count usage.
-        if limit is None:
-            state = self._load_bucket_state(key) or {}
-            used = int(state.get("used", 0)) + 1
-            state.update(
-                {
-                    "tokens": _UNLIMITED_SENTINEL,
-                    "last_update": now,
-                    "used": used,
-                }
-            )
-            self._save_bucket_state(key, state, window_seconds)
-            return True
-
-        # Finite limit → real token bucket.
-        capacity = int(limit)
-
-        # "No usage" tier: always disallow but still count.
-        if capacity <= 0:
-            state = self._load_bucket_state(key) or {}
-            used = int(state.get("used", 0)) + 1
-            state.update(
-                {
-                    "tokens": 0.0,
-                    "last_update": now,
-                    "used": used,
-                }
-            )
-            self._save_bucket_state(key, state, window_seconds)
-            return False
-
-        # Load existing state or initialize a fresh bucket.
-        state = self._load_bucket_state(key) or {}
-        raw_tokens = state.get("tokens", capacity)
-        # Treat the unlimited sentinel as a full bucket if the tier changed.
-        tokens = float(capacity if raw_tokens == _UNLIMITED_SENTINEL else raw_tokens)
-        last_update = float(state.get("last_update", now))
-        used = int(state.get("used", 0))
-
-        # Refill tokens based on elapsed time.
-        delta = max(0.0, now - last_update)
-        rate = float(capacity) / float(window_seconds)  # tokens per second
-        tokens = min(float(capacity), tokens + rate * delta)
-
-        # Try to acquire a token.
-        allowed = tokens >= 1.0
-        if allowed:
-            tokens -= 1.0
-
-        used += 1
-
-        new_state = {
-            "tokens": tokens,
-            "last_update": now,
-            "used": used,
-        }
-        self._save_bucket_state(key, new_state, window_seconds)
-
-        return allowed
 
     def _is_global_admin(self, handler_self):
         """
@@ -481,75 +343,20 @@ class RateLimiter:
         window_seconds = cfg["window_seconds"]
         tier_limits = cfg["tiers"]
 
-        # Find their limit. If their exact tier isn't present, fallback to tier.free.
-        limit = tier_limits.get(
-            tier_ability,
-            tier_limits.get("tier.free", None),
-        )
-
+        # Missing configuration must not accidentally grant unlimited access.
+        limit = tier_limits.get(tier_ability, tier_limits.get("tier.free", 0))
         key = self._redis_key(user_id, action_name)
-        return self._increment_and_check(key, window_seconds, limit)
+        return self.backend.consume(key, window_seconds, limit)
 
     # ------------------------------------------------------------------------
     # Reporting / introspection
     # ------------------------------------------------------------------------
 
     def report(self):
-        """
-        Return a nested dict summarizing current usage counts
-        for all live buckets in the backing store.
-
-        Shape:
-            {
-              "<action_name>": {
-                 "<user_id>": <total_used>,
-                 ...
-              },
-              ...
-            }
-
-        Notes:
-        - Under the token-bucket scheme, we aggregate the "used" field for
-          each (user, action) key:
-              rate|<user_id>|<action_name>
-        - This is *not* a strict billing ledger. It's an ops/debug snapshot.
-        - Uses SCAN rather than KEYS to avoid blocking Redis on large keyspaces.
-        """
-        summary = defaultdict(lambda: defaultdict(int))
-
-        try:
-            # SCAN iterates incrementally; safe on large keyspaces unlike KEYS.
-            cursor = 0
-            while True:
-                cursor, keys = self.client.scan(cursor, match="rate|*", count=100)
-                for raw_key in keys:
-                    if isinstance(raw_key, bytes):
-                        raw_key = raw_key.decode("utf-8", "replace")
-
-                    # Expect "rate|<user_id>|<action_name>"
-                    parts = raw_key.split("|", 2)
-                    if len(parts) != 3:
-                        continue
-
-                    _prefix, user_id, action_name = parts
-
-                    state = self._load_bucket_state(raw_key)
-                    if not state:
-                        continue
-
-                    used_val = state.get("used")
-                    try:
-                        count = int(used_val)
-                    except (TypeError, ValueError):
-                        continue
-
-                    summary[action_name][user_id] += count
-
-                if cursor == 0:
-                    break
-
-        except Exception:
-            pass
-
-        # convert defaultdicts back to plain dicts for cleanliness
-        return {action: dict(users) for action, users in summary.items()}
+        """Live usage snapshot, not a persistent billing ledger."""
+        summary = defaultdict(dict)
+        for key, state in self.backend.snapshot().items():
+            if key.startswith("rate|"):
+                uid, action = key[5:].rsplit("|", 1)
+                summary[action][uid] = int(state["used"])
+        return dict(summary)

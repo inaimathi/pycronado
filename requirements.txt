@@ -1,3 +1,2 @@
-tornado==6.4.2
-pyjwt[crypto]
-fakeredis==2.32.0
+tornado==6.6
+pyjwt[crypto]==2.15.1

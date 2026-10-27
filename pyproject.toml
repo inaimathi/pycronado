@@ -4,19 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycronado"
-version = "1.0.7"
+version = "1.0.8"
 authors = [
   { name="inaimathi", email="leo.zovic@gmail.com" },
 ]
 description = "Set of trivial tools for building microservices with Tornado"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dependencies = ["tornado", "pyjwt[crypto]", "fakeredis==2.32.0"]
+dependencies = ["tornado==6.6", "pyjwt[crypto]==2.15.1"]
+
+[project.optional-dependencies]
+redis = ["redis==8.1.0"]
+test = ["fakeredis[lua]==2.32.0"]
 
 [project.urls]
 Homepage = "https://github.com/inaimathi/pycronado"

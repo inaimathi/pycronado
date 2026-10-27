@@ -226,6 +226,8 @@ class PublicJSONHandler(
 
 
 class JSONHandler(PublicJSONHandler, UserMixin):
+    jwt_purposes = (None,)
+
     def prepare(self):
         super().prepare()
 
@@ -239,12 +241,13 @@ class JSONHandler(PublicJSONHandler, UserMixin):
             self.logger.debug(
                 "Authentication rejected: missing JWT method=%s uri=%s",
                 self.request.method,
-                self.request.uri,
+                self.request.path,
             )
             self.json(
                 {
                     "status": "error",
                     "message": "forbidden",
+                    "code": "invalid_token",
                 },
                 403,
             )
@@ -252,18 +255,19 @@ class JSONHandler(PublicJSONHandler, UserMixin):
             return
 
         try:
-            self.JWT = token.decode(raw_jwt)
+            self.JWT = token.decode(raw_jwt, allowed_purposes=self.jwt_purposes)
         except Exception:
             # Logs the exception and traceback, but not the raw token.
             self.logger.exception(
                 "Authentication rejected: JWT decode failed " "method=%s uri=%s",
                 self.request.method,
-                self.request.uri,
+                self.request.path,
             )
             self.json(
                 {
                     "status": "error",
                     "message": "forbidden",
+                    "code": "invalid_token",
                 },
                 403,
             )
@@ -272,7 +276,7 @@ class JSONHandler(PublicJSONHandler, UserMixin):
 
     def decoded_jwt(self):
         if not hasattr(self, "JWT"):
-            self.JWT = token.decode(self.jwt())
+            self.JWT = token.decode(self.jwt(), allowed_purposes=self.jwt_purposes)
         return self.JWT
 
 

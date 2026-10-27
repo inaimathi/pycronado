@@ -74,55 +74,32 @@ def ensureFreshKeys(key_size=4096):
 
 
 def writePrivateKey(private_key_pem, pathname, mode=0o600):
-    if isinstance(private_key_pem, str):
-        data = private_key_pem.encode("utf-8")
-    else:
-        data = private_key_pem
-
+    """Create a private key without overwriting an existing identity."""
+    data = private_key_pem.encode() if isinstance(private_key_pem, str) else private_key_pem
     parent = os.path.dirname(pathname)
-    if parent and not os.path.isdir(parent):
-        os.makedirs(parent, exist_ok=True)
-
-    tmp_path = f"{pathname}.tmp"
-    with open(tmp_path, "wb") as fh:
+    if parent:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd = os.open(pathname, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(fd, "wb") as fh:
         fh.write(data)
-    os.replace(tmp_path, pathname)
-
-    try:
-        os.chmod(pathname, mode)
-    except Exception:
-        # best effort; ignore permission failures on weird filesystems
-        pass
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def ensureKeysFrom(key_size=4096, file_path=None):
-    # Ephemeral mode: just generate and don't persist.
     if file_path is None:
         return ensureFreshKeys(key_size=key_size)
-
-    # Persistent mode.
-    if os.path.exists(file_path):
+    if not os.path.exists(file_path):
+        pem = mkPrivateKey(key_size=key_size)
         try:
-            with open(file_path, "rb") as fh:
-                pem_bytes = fh.read()
-            # Validate we can actually parse it as a private key. If this fails,
-            # we'll fall through to generation.
-            decodePrivateKey(pem_bytes)
-            ensureKeysFromPEM(pem_bytes)
-            return pem_bytes
-        except Exception:
-            # fall through to generate-and-write
-            pass
-
-    # No usable file: generate, write, then load.
-    pem_bytes = mkPrivateKey(key_size=key_size)
-    try:
-        writePrivateKey(pem_bytes, file_path, mode=0o600)
-    except Exception:
-        # best effort: even if we fail to persist, we can still run with in-memory key
-        pass
-    ensureKeysFromPEM(pem_bytes)
-    return pem_bytes
+            writePrivateKey(pem, file_path)
+        except FileExistsError:
+            pass  # Another process created it. Never replace it.
+    # Invalid, unreadable or unpersistable keys fail startup. No silent rotation.
+    with open(file_path, "rb") as fh:
+        pem = fh.read()
+    ensureKeysFromPEM(pem)
+    return pem
 
 
 def encode(payload_obj):
@@ -130,14 +107,17 @@ def encode(payload_obj):
     return jwt.encode(payload_obj, JWT_PRIVKEY, algorithm="RS256")
 
 
-def decode(tok):
+def decode(tok, *, allowed_purposes=(None,)):
     assert JWT_PUBKEY, "Need public key in JWT_PUBKEY"
-    return jwt.decode(
-        tok,
-        JWT_PUBKEY,
-        issuer=JWT_ISSUER,
+    audience = ENV.get("JWT_AUDIENCE") or None
+    claims = jwt.decode(
+        tok, JWT_PUBKEY, issuer=JWT_ISSUER, audience=audience,
         algorithms=["RS256"],
+        options={"require": ["exp", "iat"], "verify_aud": audience is not None},
     )
+    if claims.get("purpose") not in allowed_purposes:
+        raise InvalidTokenError("Token purpose is not valid here")
+    return claims
 
 
 def hasValidSig(token):

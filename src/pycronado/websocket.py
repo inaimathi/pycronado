@@ -1,5 +1,7 @@
 # src/pycronado/websocket.py
 
+import asyncio
+import time
 import json
 import re
 from collections import defaultdict
@@ -71,10 +73,24 @@ class WebSocketHub(LoggerMixin):
             default=date_serializer,
         )
 
+    def _write(self, client, message):
+        if hasattr(client, "JWT") and client.JWT.get("exp", 0) <= time.time():
+            self.unsubscribe_all(client)
+            client.on_auth_failure()
+            return
+        pending = client.write_message(self._serialize_for(client, message))
+        if pending is not None:
+            def completed(future):
+                try:
+                    future.result()
+                except (Exception, asyncio.CancelledError):
+                    self.unsubscribe_all(client)
+            pending.add_done_callback(completed)
+
     def _publish_now(self, channel: str, message: Any) -> None:
         for client in list(self.channels.get(channel, ())):
             try:
-                client.write_message(self._serialize_for(client, message))
+                self._write(client, message)
             except tornado.websocket.WebSocketClosedError:
                 self.unsubscribe(channel, client)
             except Exception:
@@ -87,7 +103,7 @@ class WebSocketHub(LoggerMixin):
 
         for client in list(all_clients):
             try:
-                client.write_message(self._serialize_for(client, message))
+                self._write(client, message)
             except tornado.websocket.WebSocketClosedError:
                 self.unsubscribe_all(client)
             except Exception:
@@ -149,7 +165,18 @@ class BaseChannelSocketHandler(
         return hub
 
     def write_json(self, data: Any) -> None:
-        self.write_message(self.dumps(data))
+        try:
+            pending = self.write_message(self.dumps(data))
+        except tornado.websocket.WebSocketClosedError:
+            self.close()
+            return
+        if pending is not None:
+            def completed(future):
+                try:
+                    future.result()
+                except (Exception, asyncio.CancelledError):
+                    self.close()
+            pending.add_done_callback(completed)
 
     def parse_json(self, raw: str) -> Optional[dict]:
         try:
@@ -164,7 +191,7 @@ class BaseChannelSocketHandler(
     def check_origin(self, origin: str) -> bool:
         wl = self.get_origin_whitelist()
         if wl is None:
-            return True  # legacy allow-all behavior
+            return super().check_origin(origin)
 
         req_origin = normalize_origin(origin)
         allowed = {normalize_origin(o) for o in wl}
@@ -186,10 +213,14 @@ class BaseChannelSocketHandler(
 
     def open(self, channel: Optional[str] = None):
         self._ws_channels = set()
+        self._expiry_handle = None
 
         if not self.can_connect():
             return self.on_auth_failure()
 
+        if hasattr(self, "JWT"):
+            delay = max(0, self.JWT["exp"] - time.time())
+            self._expiry_handle = tornado.ioloop.IOLoop.current().call_later(delay, self.on_auth_failure)
         ch = channel or self.get_argument("channel", "default")
         self._subscribe(ch, notify=False)
         self.write_json({"type": "ready", "channels": [ch]})
@@ -215,6 +246,9 @@ class BaseChannelSocketHandler(
             return
 
     def on_close(self):
+        handle = getattr(self, "_expiry_handle", None)
+        if handle is not None:
+            handle.cancel()
         try:
             self._hub().unsubscribe_all(self)
         except Exception:
