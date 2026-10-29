@@ -36,6 +36,14 @@ class PublicJSONHandler(
 ):
     origin_whitelist: Optional[Sequence[str]] = None
 
+    def clear(self):
+        super().clear()
+        # Tornado clears response headers before write_error(), including in
+        # applications with their own error formatter. Initialization calls
+        # clear() before prepare(); only reapply after request state exists.
+        if hasattr(self, "_data"):
+            self._apply_cors()
+
     def prepare(self):
         self._reset_logger()
         self._data = None
@@ -56,8 +64,13 @@ class PublicJSONHandler(
         # Default behavior: allow all (legacy / current behavior)
         if wl is None:
             self.set_header("Access-Control-Allow-Origin", "*")
-            self.set_header("Access-Control-Allow-Headers", "*")
-            self.set_header("Access-Control-Allow-Methods", "*")
+            # Authorization is a CORS non-wildcard request header. Reflect the
+            # preflight's requested header names instead of relying on '*'.
+            headers = self.request.headers.get("Access-Control-Request-Headers")
+            method = self.request.headers.get("Access-Control-Request-Method")
+            self.set_header("Access-Control-Allow-Headers", headers or "*, Authorization")
+            self.set_header("Access-Control-Allow-Methods", method or "*")
+            self.add_header("Vary", "Access-Control-Request-Headers, Access-Control-Request-Method")
             return
 
         # Whitelist behavior: reflect allowed Origin exactly.
@@ -306,6 +319,8 @@ async def start(
     debug=False,
     websocket=False,
     max_body_size=None,
+    address=None,
+    log_function=None,
 ):
     if default_handler_class is None:
         default_handler_class = Default404Handler
@@ -316,6 +331,7 @@ async def start(
         debug=debug,
         static_path=static_path,
         static_url_prefix=static_url_prefix,
+        log_function=log_function,
     )
     app.logger = getLogger(name)
 
@@ -330,5 +346,11 @@ async def start(
     listen_kwargs = {}
     if max_body_size is not None:
         listen_kwargs["max_body_size"] = int(max_body_size)
-    app.listen(int(port), **listen_kwargs)
-    await asyncio.Event().wait()
+    if address is not None:
+        listen_kwargs["address"] = address
+    server = app.listen(int(port), **listen_kwargs)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        server.stop()
+        await server.close_all_connections()
