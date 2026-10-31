@@ -331,7 +331,7 @@ async def start(
         debug=debug,
         static_path=static_path,
         static_url_prefix=static_url_prefix,
-        log_function=log_function,
+        **({"log_function": log_function} if log_function is not None else {}),
     )
     app.logger = getLogger(name)
 
