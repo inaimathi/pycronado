@@ -14,6 +14,7 @@ import tornado.iostream
 import tornado.web
 
 from . import token
+from .channel import ChannelHub, ChannelEvent, get_channel_hub, set_channel_hub, publish
 from .auth import UserMixin, requires  # noqa: F401
 from .mixins import LoggerMixin  # noqa: F401
 from .mixins import (JSONSerializationMixin, NDJSONMixin, _CallableLogger,
@@ -345,6 +346,10 @@ async def start(
     websocket_max_message_size=1024 * 1024,
     websocket_ping_interval=30,
     websocket_ping_timeout=30,
+    sse=False,
+    webrtc=False,
+    channel_hub_options=None,
+    webrtc_options=None,
 ):
     if default_handler_class is None:
         default_handler_class = Default404Handler
@@ -362,10 +367,19 @@ async def start(
     )
     app.logger = getLogger(name)
 
+    if channel_hub_options is not None and websocket_hub_options is not None:
+        raise ValueError("Use channel_hub_options or websocket_hub_options, not both")
+    app.channel_hub = None
     app.ws_hub = None
-    if websocket:
-        app.ws_hub = WebSocketHub(ioloop=tornado.ioloop.IOLoop.current(), **(websocket_hub_options or {}))
-        set_ws_hub(app.ws_hub)
+    app.webrtc_manager = None
+    if websocket or sse or webrtc:
+        app.channel_hub = ChannelHub(ioloop=tornado.ioloop.IOLoop.current(),
+                                     **(channel_hub_options or websocket_hub_options or {}))
+        app.ws_hub = app.channel_hub  # old applications can keep using this name
+        if webrtc:
+            from .webrtc import WebRTCManager
+            app.webrtc_manager = WebRTCManager(app.channel_hub, **(webrtc_options or {}))
+        set_channel_hub(app.channel_hub)
 
     app.logger.info(f"  listening on {port}...")
     listen_kwargs = {}
@@ -382,6 +396,8 @@ async def start(
             app.ws_hub.close()
             if get_ws_hub() is app.ws_hub:
                 set_ws_hub(None)
+        if app.webrtc_manager is not None:
+            await app.webrtc_manager.aclose()
         if server is not None:
             server.stop()
             await server.close_all_connections()

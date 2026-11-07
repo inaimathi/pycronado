@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pycronado channels</title>
+<style>
+body { max-width: 900px; margin: 3rem auto; padding: 0 1rem; font: 16px system-ui; background: #12212b; color: #edf4f7; }
+button, select, input { padding: .6rem; margin: .25rem; font: inherit; }
+pre { white-space: pre-wrap; background: #09131b; padding: 1rem; min-height: 18rem; }
+small { color: #b2c7d1; }
+</style>
+<h1>Pycronado channels</h1>
+<p>Open two tabs and choose different transports. Reliable commands appear in every tab subscribed to <code>demo</code>. State updates go only to WebRTC peers.</p>
+<select id="transport"><option>WebSocket</option><option>SSE</option><option>WebRTC</option></select>
+<button id="connect">Connect</button><button id="disconnect">Disconnect</button>
+<p><input id="message" value="hello"><button id="send">Send reliable command</button><button id="state">Send state snapshot</button></p>
+<small>SSE is receive-only. This public example is intended for localhost; production needs authentication, room policies and an ICE/TURN deployment.</small>
+<pre id="log"></pre>
+<script type="module">
+const $ = id => document.getElementById(id);
+const log = (type, value) => { $("log").textContent = (`${type}: ${typeof value === "string" ? value : JSON.stringify(value)}\n` + $("log").textContent).slice(0, 20000); };
+let ws, sse, pc, control, state, generation = 0, tick = 0;
+function disconnect() { generation++; ws?.close(); sse?.close(); pc?.close(); ws = sse = pc = control = state = undefined; }
+function gather(peer) {
+  if (peer.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const done = () => { if (peer.iceGatheringState === "complete") { cleanup(); resolve(); } };
+    const timer = setTimeout(() => { cleanup(); reject(new Error("ICE gathering timed out")); }, 15000);
+    function cleanup() { clearTimeout(timer); peer.removeEventListener("icegatheringstatechange", done); }
+    peer.addEventListener("icegatheringstatechange", done);
+    done();
+  });
+}
+$("disconnect").onclick = () => { disconnect(); log("status", "disconnected"); };
+$("connect").onclick = async () => {
+  disconnect();
+  const current = generation;
+  try {
+    if ($("transport").value === "WebSocket") {
+      const url = new URL("/ws?channel=demo", location.href); url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(url); ws.onmessage = event => log("reliable", event.data); ws.onclose = event => log("closed", event.code);
+    } else if ($("transport").value === "SSE") {
+      sse = new EventSource("/events?channel=demo"); sse.onmessage = event => log("event", event.data);
+      sse.onerror = () => log("SSE", "connection interrupted; EventSource may retry");
+    } else {
+      const peer = new RTCPeerConnection({iceServers: []}); pc = peer;
+      control = peer.createDataChannel("control", {protocol: "pycronado.v1"});
+      state = peer.createDataChannel("state", {protocol: "pycronado.v1", ordered: false, maxRetransmits: 0});
+      control.onmessage = event => log("reliable", event.data); state.onmessage = event => log("state", event.data);
+      peer.onconnectionstatechange = () => log("WebRTC", peer.connectionState);
+      await peer.setLocalDescription(await peer.createOffer());
+      await gather(peer);
+      if (generation !== current) return;
+      const response = await fetch("/offer", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({type: peer.localDescription.type, sdp: peer.localDescription.sdp, channel: "demo"})});
+      if (!response.ok) throw new Error(`Signaling failed: ${response.status}`);
+      const answer = await response.json();
+      if (generation === current) await peer.setRemoteDescription(answer);
+    }
+  } catch (error) { if (generation === current) { disconnect(); log("error", error.message); } }
+};
+$("send").onclick = () => {
+  const message = JSON.stringify({action: "message", channel: "demo", data: {text: $("message").value}});
+  if (ws?.readyState === WebSocket.OPEN) ws.send(message);
+  else if (control?.readyState === "open") control.send(message);
+  else log("status", "Connect a WebSocket or WebRTC client first.");
+};
+$("state").onclick = () => {
+  if (state?.readyState === "open" && state.bufferedAmount < 65536)
+    state.send(JSON.stringify({action: "message", channel: "demo", data: {tick: ++tick, position: Math.random()}}));
+  else log("status", "State channel unavailable or congested.");
+};
+window.addEventListener("pagehide", disconnect);
+</script>
+</html>
