@@ -34,7 +34,8 @@ class MemoryBucketStore:
     """Thread-safe, coroutine-safe bounded storage; no await inside its lock.
 
     Sharing one store between limiter instances shares counters. Idle entries
-    expire; live entries are never evicted to make room (which would reset quota).
+    expire (a full store may reject new keys until the next 60-second sweep);
+    live entries are never evicted to make room (which would reset quota).
     """
     def __init__(self, max_entries=100000, clock=time.monotonic):
         self._clock = clock
@@ -46,11 +47,14 @@ class MemoryBucketStore:
     def consume(self, key, window, limit):
         with self._lock:
             now = self._clock()
-            if now >= self._next_cleanup or len(self._entries) >= self.max_entries:
+            if now >= self._next_cleanup:
                 self._entries = {k: v for k, v in self._entries.items() if v[1] > now}
                 self._next_cleanup = now + 60
             entry = self._entries.get(key)
-            state = entry[0] if entry and entry[1] > now else None
+            if entry is not None and entry[1] <= now:
+                self._entries.pop(key)
+                entry = None
+            state = entry[0] if entry else None
             if state is None and len(self._entries) >= self.max_entries:
                 raise BucketUnavailable("Local bucket capacity exhausted")
             state, allowed = advance(state, now, window, limit)

@@ -45,7 +45,12 @@ def normalize_origin(raw: str | None) -> Optional[str]:
     if not s or s.lower() == "null":
         return None
 
-    p = urlparse(s)
+    try:
+        p = urlparse(s)
+        port = p.port
+        host = p.hostname
+    except ValueError:
+        return None
 
     scheme = (p.scheme or "").lower()
     if scheme not in ("http", "https"):
@@ -57,7 +62,6 @@ def normalize_origin(raw: str | None) -> Optional[str]:
     if p.path not in ("", "/") or p.query or p.fragment:
         return None
 
-    host = p.hostname
     if not host:
         return None
     host = host.lower()
@@ -66,7 +70,6 @@ def normalize_origin(raw: str | None) -> Optional[str]:
     if ":" in host and not host.startswith("[") and host.count(":") >= 2:
         host = f"[{host}]"
 
-    port = p.port
     if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
         port = None
 

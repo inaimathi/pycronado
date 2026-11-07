@@ -49,6 +49,13 @@ class PublicJSONHandler(
         self._data = None
         self._apply_cors()
 
+    def on_connection_close(self):
+        super().on_connection_close()
+        for name in ("_ndjson_task", "_file_task"):
+            task = getattr(self, name, None)
+            if task is not None and not task.done() and not task.cancelling():
+                task.cancel()
+
     def get_origin_whitelist(self) -> Optional[Sequence[str]]:
         """
         Override-able hook (mirrors get_json_serializer style).
@@ -73,6 +80,9 @@ class PublicJSONHandler(
             self.add_header("Vary", "Access-Control-Request-Headers, Access-Control-Request-Method")
             return
 
+        # Include Vary even for denied/missing origins so caches cannot reuse
+        # that response for an allowed origin.
+        self.add_header("Vary", "Origin, Access-Control-Request-Headers, Access-Control-Request-Method")
         # Whitelist behavior: reflect allowed Origin exactly.
         req_origin = normalize_origin(self.request.headers.get("Origin"))
         allowed = {normalize_origin(o) for o in wl}
@@ -94,10 +104,6 @@ class PublicJSONHandler(
             else:
                 self.set_header("Access-Control-Allow-Methods", "*")
 
-            try:
-                self.add_header("Vary", "Origin")
-            except Exception:
-                self.set_header("Vary", "Origin")
         else:
             # Disallowed origin: send no CORS allow headers at all.
             try:
@@ -119,22 +125,21 @@ class PublicJSONHandler(
 
     def param(self, param_name, default=None):
         if self._data is None:
-            content_type = self.request.headers.get("Content-Type", "")
-            if self.request.body and "application/json" in content_type:
+            content_type = self.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            raw = (self.request.body if content_type == "application/json"
+                   else self.get_body_argument("json", None))
+            self._data = {}
+            if raw:
                 try:
-                    parsed = json.loads(self.request.body)
-                    self._data = parsed if isinstance(parsed, dict) else {}
-                except json.JSONDecodeError:
-                    self._data = {}
-            else:
-                self._data = {}
-                json_data = self.get_body_argument("json", None)
-                if json_data:
-                    try:
-                        self._data.update(json.loads(json_data))
-                    except json.JSONDecodeError:
-                        pass
-        return self._data.get(param_name, self.get_argument(param_name, default))
+                    parsed = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    raise tornado.web.HTTPError(400, reason="Invalid JSON") from None
+                if not isinstance(parsed, dict):
+                    raise tornado.web.HTTPError(400, reason="JSON must be an object")
+                self._data = parsed
+        if param_name in self._data:
+            return self._data[param_name]
+        return self.get_argument(param_name, default)
 
     def file_param(self, param_name, default=None, max_filesize=20 * 1024 * 1024):
         files = self.request.files.get(param_name)
@@ -144,34 +149,32 @@ class PublicJSONHandler(
         file_info = files[0]
 
         if len(file_info["body"]) > max_filesize:
-            return self.jsonerr(
-                f"File too large. Maximum size is {max_filesize} bytes.", 413
-            )
+            raise tornado.web.HTTPError(413, reason="File too large")
 
         return file_info["body"]
 
+    def _schedule_file(self, coroutine):
+        # Legacy synchronous handlers may call file()/filebytes() without await.
+        # Keep their response open while the asynchronous writer drains it.
+        self._auto_finish = False
+        async def send():
+            try:
+                await coroutine
+            except asyncio.CancelledError:
+                self.request.connection.close()
+                raise
+            except Exception:
+                self.logger.exception("File response failed")
+                if self._headers_written:
+                    self.request.connection.close()
+                else:
+                    self.send_error(500)
+        self._file_task = asyncio.create_task(send())
+        return self._file_task
+
     def file(self, fpath, mimetype=None):
-        assert os.path.exists(fpath), f"Path {fpath} does not exist"
-        assert os.path.isfile(fpath), f"Path {fpath} is not a file"
-
-        if mimetype is None:
-            content_type, _encoding = mimetypes.guess_type(fpath)
-            mimetype = content_type
-
-        assert mimetype, f"Could not infer mimetype of {fpath} and no default provided"
-
-        self.set_header("Content-Type", mimetype)
-        self.set_header("Content-Length", os.path.getsize(fpath))
-
-        with open(fpath, "rb") as f:
-            while True:
-                chunk = f.read(65 * 1024)
-                if not chunk:
-                    break
-                self.write(chunk)
-                self.flush()
-
-        self.finish()
+        """Schedule a streamed response; the returned task can also be awaited."""
+        return self._schedule_file(self.afile(fpath, mimetype=mimetype))
 
     async def afile(self, fpath, mimetype=None, filename=None, chunk_size=256 * 1024):
         """
@@ -179,44 +182,63 @@ class PublicJSONHandler(
         ~one chunk and other requests keep being served during a large send.
         Stops quietly if the client disconnects.
         """
-        assert os.path.isfile(fpath), f"Path {fpath} is not a file"
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if not await asyncio.to_thread(os.path.isfile, fpath):
+            raise FileNotFoundError(fpath)
         if mimetype is None:
             mimetype = mimetypes.guess_type(fpath)[0]
-        assert mimetype, f"Could not infer mimetype of {fpath} and no default provided"
+        mimetype = mimetype or "application/octet-stream"
 
         self.set_header("Content-Type", mimetype)
-        self.set_header("Content-Length", os.path.getsize(fpath))
+        self.set_header("Content-Length", await asyncio.to_thread(os.path.getsize, fpath))
         if filename:
             self.set_header("Content-Disposition", _content_disposition(filename))
         try:
-            with open(fpath, "rb") as f:
+            opening = asyncio.create_task(asyncio.to_thread(open, fpath, "rb"))
+            try:
+                f = await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                f = await opening
+                f.close()
+                raise
+            with f:
                 while True:
-                    chunk = f.read(chunk_size)
+                    # Wait for an in-flight read before closing its file on cancellation.
+                    read = asyncio.create_task(asyncio.to_thread(f.read, chunk_size))
+                    try:
+                        chunk = await asyncio.shield(read)
+                    except asyncio.CancelledError:
+                        await read
+                        raise
                     if not chunk:
                         break
                     self.write(chunk)
                     await self.flush()
+            await self.finish()
         except tornado.iostream.StreamClosedError:
             return
-        self.finish()
 
     def filebytes(self, data, mimetype=None, extension=None):
-        assert isinstance(data, bytes), f"Data must be bytes, got {type(data)}"
-        assert mimetype or extension, "Mimetype or extension is required for filebytes"
+        """Schedule a bounded streaming write of bytes already in memory."""
+        return self._schedule_file(self.afilebytes(data, mimetype, extension))
 
-        if mimetype is None:
-            mimetype = mimetypes.guess_type(f"foo.{extension}")
-
-        self.set_header("Content-Type", mimetype)
+    async def afilebytes(self, data, mimetype=None, extension=None, chunk_size=256 * 1024):
+        if not isinstance(data, bytes):
+            raise TypeError("data must be bytes")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if mimetype is None and extension:
+            mimetype = mimetypes.guess_type(f"file.{extension}")[0]
+        self.set_header("Content-Type", mimetype or "application/octet-stream")
         self.set_header("Content-Length", len(data))
-
-        chunk_size = 65 * 1024
-        for i in range(0, len(data), chunk_size):
-            chunk = data[i : i + chunk_size]
-            self.write(chunk)
-            self.flush()
-
-        self.finish()
+        try:
+            for offset in range(0, len(data), chunk_size):
+                self.write(data[offset:offset + chunk_size])
+                await self.flush()
+            await self.finish()
+        except tornado.iostream.StreamClosedError:
+            return
 
     def jsonerr(self, message, status=500):
         self.json({"status": "error", "message": message}, status)
@@ -269,13 +291,11 @@ class JSONHandler(PublicJSONHandler, UserMixin):
 
         try:
             self.JWT = token.decode(raw_jwt, allowed_purposes=self.jwt_purposes)
-        except Exception:
-            # Logs the exception and traceback, but not the raw token.
-            self.logger.exception(
-                "Authentication rejected: JWT decode failed " "method=%s uri=%s",
-                self.request.method,
-                self.request.path,
-            )
+        except Exception as exc:
+            if isinstance(exc, token.InvalidTokenError):
+                self.logger.debug("Authentication rejected: %s", type(exc).__name__)
+            else:
+                self.logger.exception("JWT verification failed")
             self.json(
                 {
                     "status": "error",
@@ -295,9 +315,9 @@ class JSONHandler(PublicJSONHandler, UserMixin):
 
 class Default404Handler(PublicJSONHandler):
     def prepare(self):
+        super().prepare()
         self.json({"status": "error", "message": "not found"}, status=404)
         self.finish()
-        return self.request.connection.close()
 
 
 class HealthHandler(PublicJSONHandler):
@@ -321,6 +341,10 @@ async def start(
     max_body_size=None,
     address=None,
     log_function=None,
+    websocket_hub_options=None,
+    websocket_max_message_size=1024 * 1024,
+    websocket_ping_interval=30,
+    websocket_ping_timeout=30,
 ):
     if default_handler_class is None:
         default_handler_class = Default404Handler
@@ -331,16 +355,17 @@ async def start(
         debug=debug,
         static_path=static_path,
         static_url_prefix=static_url_prefix,
+        websocket_max_message_size=websocket_max_message_size,
+        websocket_ping_interval=websocket_ping_interval,
+        websocket_ping_timeout=websocket_ping_timeout,
         **({"log_function": log_function} if log_function is not None else {}),
     )
     app.logger = getLogger(name)
 
     app.ws_hub = None
     if websocket:
-        app.ws_hub = WebSocketHub(ioloop=tornado.ioloop.IOLoop.current())
+        app.ws_hub = WebSocketHub(ioloop=tornado.ioloop.IOLoop.current(), **(websocket_hub_options or {}))
         set_ws_hub(app.ws_hub)
-    else:
-        set_ws_hub(None)
 
     app.logger.info(f"  listening on {port}...")
     listen_kwargs = {}
@@ -348,9 +373,15 @@ async def start(
         listen_kwargs["max_body_size"] = int(max_body_size)
     if address is not None:
         listen_kwargs["address"] = address
-    server = app.listen(int(port), **listen_kwargs)
+    server = None
     try:
+        server = app.listen(int(port), **listen_kwargs)
         await asyncio.Event().wait()
     finally:
-        server.stop()
-        await server.close_all_connections()
+        if app.ws_hub is not None:
+            app.ws_hub.close()
+            if get_ws_hub() is app.ws_hub:
+                set_ws_hub(None)
+        if server is not None:
+            server.stop()
+            await server.close_all_connections()

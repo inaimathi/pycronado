@@ -1,5 +1,6 @@
 # src/pycronado/token.py
 import os
+import tempfile
 from os import environ as ENV
 
 import jwt
@@ -79,11 +80,25 @@ def writePrivateKey(private_key_pem, pathname, mode=0o600):
     parent = os.path.dirname(pathname)
     if parent:
         os.makedirs(parent, mode=0o700, exist_ok=True)
-    fd = os.open(pathname, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
+    # Publish a fully written file atomically. O_EXCL on the destination alone
+    # exposes an empty/partial PEM to concurrent startup readers.
+    fd, temporary = tempfile.mkstemp(prefix=".jwt-key-", dir=parent or ".")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            os.fchmod(fh.fileno(), mode)
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # link() never overwrites an existing identity and is atomic on the
+        # same filesystem. Both names are in the destination directory.
+        os.link(temporary, pathname)
+        directory_fd = os.open(parent or ".", os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.unlink(temporary)
 
 
 def ensureKeysFrom(key_size=4096, file_path=None):

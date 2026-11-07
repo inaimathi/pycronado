@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+import logging
 from datetime import date, datetime, time
 from typing import Any, AsyncIterator, Callable, Iterator, Optional
 
 import tornado.iostream
+import tornado.web
 
 from .util import getLogger
 
@@ -39,16 +41,17 @@ class _CallableLogger:
         return repr(self._log)
 
 
+class _RequestLogger(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return f"[{self.extra['method']} {self.extra['path']}] {msg}", kwargs
+
+
 class LoggerMixin:
-    """
-    Provides ``self.logger`` (and the legacy ``self.logger()``) backed by a
-    lazily-created, per-instance stdlib logger.
+    """Stable class logger with method/path context, excluding query strings.
 
-    The name is derived from ``self.request.uri`` when available (HTTP/WS
-    handlers) and falls back to the class name otherwise (e.g. WebSocketHub).
-
-    Call ``self._reset_logger()`` in ``prepare()`` so the name is refreshed
-    for each new request.
+    Both self.logger.info(...) and the legacy self.logger().info(...) work.
+    Explicitly logged application data and custom access loggers remain the
+    application's responsibility; never log credentials or entire requests.
     """
 
     def _reset_logger(self) -> None:
@@ -58,12 +61,25 @@ class LoggerMixin:
     def logger(self) -> _CallableLogger:
         proxy = self.__dict__.get("_logger_proxy")
         if proxy is None:
-            path = getattr(getattr(self, "request", None), "path", None)
-            name = f"handler:{path}" if path else type(self).__name__
-
-            proxy = _CallableLogger(getLogger(name))
+            log = getLogger(f"{type(self).__module__}.{type(self).__qualname__}")
+            request = getattr(self, "request", None)
+            if request is not None:
+                log = _RequestLogger(log, {"method": request.method, "path": request.path})
+            proxy = _CallableLogger(log)
             self.__dict__["_logger_proxy"] = proxy
         return proxy
+
+    def _request_summary(self):
+        # Tornado's default access logger calls this hook.
+        return f"{self.request.method} {self.request.path} ({self.request.remote_ip})"
+
+    def log_exception(self, typ, value, tb):
+        # Tornado's default exception logger also prints repr(request), which
+        # contains the URI and headers. Deliberately omit that representation.
+        if isinstance(value, tornado.web.HTTPError):
+            self.logger.warning("HTTP error status=%s", value.status_code)
+        else:
+            self.logger.error("Uncaught handler exception", exc_info=(typ, value, tb))
 
 
 class JSONSerializationMixin:
@@ -128,7 +144,7 @@ class NDJSONMixin:
 
         request = getattr(self, "request", None)
         path = getattr(request, "path", None)
-        name = f"handler:{path}" if path else type(self).__name__
+        name = f"{type(self).__module__}.{type(self).__qualname__}"
         return getLogger(name)
 
     def _log_ndjson_exception(
@@ -149,7 +165,7 @@ class NDJSONMixin:
                 "%s: method=%s uri=%s remote_ip=%s exception=%s",
                 message,
                 getattr(request, "method", None),
-                getattr(request, "uri", None),
+                getattr(request, "path", None),
                 getattr(request, "remote_ip", None),
                 type(exc).__name__,
                 exc_info=(type(exc), exc, exc.__traceback__),
@@ -200,7 +216,7 @@ class NDJSONMixin:
 
         # Prevent proxy buffering, particularly under nginx.
         self.set_header("X-Accel-Buffering", "no")
-        self.set_header("Vary", "Accept")
+        self.add_header("Vary", "Accept")
 
         try:
             self.clear_header("Content-Length")
@@ -210,221 +226,137 @@ class NDJSONMixin:
     def _encode_line(self, data: Any) -> str:
         return (data if isinstance(data, str) else self.dumps(data)) + "\n"
 
-    # ---------------------------- Synchronous API ----------------------------
+    # Synchronous writes are retained for small legacy streams. They cannot
+    # yield to network backpressure, so bound their outstanding output.
+    ndjson_max_pending_bytes = 1024 * 1024
 
-    def ndjson_start(self, status: int | None = None) -> None:
+    def _sync_flush(self, size=0):
+        pending_bytes = getattr(self, "_ndjson_pending_bytes", 0) + size
+        if pending_bytes > self.ndjson_max_pending_bytes:
+            raise BufferError("NDJSON output limit exceeded; use andjson_pump")
+        self._ndjson_pending_bytes = pending_bytes
+        future = self.flush()
+        if future is not None:
+            def done(result):
+                self._ndjson_pending_bytes -= size
+                try:
+                    result.result()
+                except (Exception, asyncio.CancelledError):
+                    self._ndjson_disconnected = True
+            future.add_done_callback(done)
+        else:
+            self._ndjson_pending_bytes -= size
+
+    def ndjson_start(self, status=None):
         if getattr(self, "_ndjson_started", False):
             return
-
         self._ensure_ndjson_headers(status)
-
-        try:
-            self.flush()
-        except tornado.iostream.StreamClosedError:
-            return
-        except Exception as exc:
-            # Preserve the old behavior of not failing startup because flush
-            # failed, but make the problem visible in server logs.
-            self._log_ndjson_exception(
-                "Failed flushing synchronous NDJSON headers",
-                exc,
-            )
-
+        self._sync_flush()
         self._ndjson_started = True
 
-    def ndjson(self, data: Any, status: int | None = None) -> None:
+    def ndjson(self, data, status=None):
+        if getattr(self, "_ndjson_disconnected", False):
+            raise tornado.iostream.StreamClosedError()
         if not getattr(self, "_ndjson_started", False):
-            self.ndjson_start(status=status)
-
+            self.ndjson_start(status)
         line = self._encode_line(data)
+        size = len(line.encode("utf-8"))
+        if getattr(self, "_ndjson_pending_bytes", 0) + size > self.ndjson_max_pending_bytes:
+            raise BufferError("NDJSON output limit exceeded; use andjson_pump")
         self.write(line)
+        self._sync_flush(size)
 
+    def ndjson_end(self):
+        if not getattr(self, "_finished", False) and not getattr(self, "_ndjson_disconnected", False):
+            self.finish()
+
+    def ndjson_pump(self, it: Iterator[Any], status=200, on_error=None, *, close_iterator=True):
+        """Consume a bounded legacy stream; close the owned iterator on exit."""
+        iterator = iter(it)
         try:
-            self.flush()
-        except tornado.iostream.StreamClosedError:
-            return
-        except Exception as exc:
-            # Preserve the old best-effort flush behavior.
-            self._log_ndjson_exception(
-                "Failed flushing synchronous NDJSON event",
-                exc,
-            )
-
-    def ndjson_end(self) -> None:
-        try:
-            if not getattr(self, "_finished", False):
-                self.finish()
-        except Exception as exc:
-            # Preserve the old best-effort finish behavior.
-            self._log_ndjson_exception(
-                "Failed finishing synchronous NDJSON response",
-                exc,
-            )
-
-    def ndjson_pump(
-        self,
-        it: Iterator[Any],
-        status: int = 200,
-        on_error: Optional[Callable[[Exception], Any]] = None,
-    ) -> None:
-        """
-        Stream a synchronous iterator into the response.
-
-        The method signature and client-facing default error payload are
-        unchanged. Unexpected iterator errors are now logged with a traceback.
-        """
-        self.ndjson_start(status)
-
-        try:
-            for item in it:
+            self.ndjson_start(status)
+            for item in iterator:
                 self.ndjson(item)
-
         except tornado.iostream.StreamClosedError:
-            # A client disconnect is not an application error.
-            return
-
-        except GeneratorExit:
-            # Preserve the previous cancellation response behavior.
-            try:
-                self.ndjson(
-                    {
-                        "type": "error",
-                        "message": "stream cancelled",
-                    }
-                )
-            finally:
-                self.ndjson_end()
-
+            self._ndjson_disconnected = True
         except Exception as exc:
-            self._log_ndjson_exception(
-                "Synchronous NDJSON stream failed",
-                exc,
-            )
-
-            payload = self._ndjson_error_payload(exc, on_error)
-
+            self._log_ndjson_exception("Synchronous NDJSON stream failed", exc)
             try:
-                self.ndjson(payload)
-            except tornado.iostream.StreamClosedError:
+                self.ndjson(self._ndjson_error_payload(exc, on_error))
+            except (tornado.iostream.StreamClosedError, BufferError):
                 pass
-            except Exception as write_exc:
-                self._log_ndjson_exception(
-                    "Failed writing synchronous NDJSON error event",
-                    write_exc,
-                )
+        finally:
+            try:
+                if close_iterator and hasattr(iterator, "close"):
+                    iterator.close()
             finally:
                 self.ndjson_end()
 
-        finally:
-            self.ndjson_end()
-
-    # ------------------------------ Async API -------------------------------
-
-    async def andjson_start(self, status: int | None = None) -> None:
+    async def andjson_start(self, status=None):
         if getattr(self, "_ndjson_started", False):
             return
-
         self._ensure_ndjson_headers(status)
-
-        try:
-            await self.flush()
-        except tornado.iostream.StreamClosedError:
-            return
-        except Exception as exc:
-            # Preserve the old behavior of allowing streaming to continue.
-            self._log_ndjson_exception(
-                "Failed flushing asynchronous NDJSON headers",
-                exc,
-            )
-
+        await self.flush()
         self._ndjson_started = True
 
-    async def andjson(self, data: Any, status: int | None = None) -> None:
+    async def andjson(self, data, status=None):
         if not getattr(self, "_ndjson_started", False):
-            await self.andjson_start(status=status)
-
-        line = self._encode_line(data)
-        self.write(line)
-
-        try:
-            await self.flush()
-        except tornado.iostream.StreamClosedError:
-            return
-        except Exception as exc:
-            # Preserve the old best-effort flush behavior.
-            self._log_ndjson_exception(
-                "Failed flushing asynchronous NDJSON event",
-                exc,
-            )
-
-        # Preserve the existing cooperative scheduling point.
+            await self.andjson_start(status)
+        self.write(self._encode_line(data))
+        await self.flush()
         await asyncio.sleep(0)
 
-    async def andjson_end(self) -> None:
-        try:
-            if not getattr(self, "_finished", False):
-                self.finish()
-        except Exception as exc:
-            # Preserve the old best-effort finish behavior.
-            self._log_ndjson_exception(
-                "Failed finishing asynchronous NDJSON response",
-                exc,
-            )
+    async def andjson_end(self):
+        if not getattr(self, "_finished", False) and not getattr(self, "_ndjson_disconnected", False):
+            result = self.finish()
+            if result is not None:
+                await result
 
-    async def andjson_pump(
-        self,
-        ait: AsyncIterator[Any],
-        status: int = 200,
-        on_error: Optional[Callable[[Exception], Any]] = None,
-    ) -> None:
+    async def andjson_pump(self, ait: AsyncIterator[Any], status=200, on_error=None, *, close_iterator=True):
+        """Consume a stream with backpressure and propagate task cancellation.
+
+        By default the pump owns/closes its iterator. Set close_iterator=False
+        only when the caller owns its lifecycle. Background jobs should publish
+        through a separate subscription iterator, not run inside this pump.
         """
-        Stream an asynchronous iterator into the response.
-
-        The method signature and existing cancellation behavior are preserved.
-        Unexpected iterator errors are now logged with their full traceback.
-        """
-        await self.andjson_start(status)
-
+        iterator = aiter(ait)
+        self._ndjson_task = asyncio.current_task()
         try:
-            async for item in ait:
+            await self.andjson_start(status)
+            async for item in iterator:
                 await self.andjson(item)
-
         except tornado.iostream.StreamClosedError:
-            # A client disconnect is not an application error.
-            return
-
+            self._ndjson_disconnected = True
         except asyncio.CancelledError:
-            # Preserve the old behavior: emit a cancellation event and consume
-            # the cancellation rather than re-raising it.
-            try:
-                await self.andjson(
-                    {
-                        "type": "error",
-                        "message": "stream cancelled",
-                    }
-                )
-            finally:
-                await self.andjson_end()
-
+            # No more writes on cancellation; finish cleanup, then propagate.
+            self._ndjson_disconnected = True
+            connection = getattr(getattr(self, "request", None), "connection", None)
+            if connection is not None:
+                connection.close()
+                # Complete Tornado's response bookkeeping on the closed socket
+                # so its task-cancellation handler does not attempt an HTTP 500.
+                if not getattr(self, "_finished", False):
+                    try:
+                        result = self.finish()
+                        if result is not None:
+                            await result
+                    except tornado.iostream.StreamClosedError:
+                        pass
+            raise
         except Exception as exc:
-            self._log_ndjson_exception(
-                "Asynchronous NDJSON stream failed",
-                exc,
-            )
-
-            payload = self._ndjson_error_payload(exc, on_error)
-
+            self._log_ndjson_exception("Asynchronous NDJSON stream failed", exc)
             try:
-                await self.andjson(payload)
+                await self.andjson(self._ndjson_error_payload(exc, on_error))
             except tornado.iostream.StreamClosedError:
-                pass
-            except Exception as write_exc:
-                self._log_ndjson_exception(
-                    "Failed writing asynchronous NDJSON error event",
-                    write_exc,
-                )
-            finally:
-                await self.andjson_end()
-
+                self._ndjson_disconnected = True
         finally:
-            await self.andjson_end()
+            try:
+                if close_iterator and hasattr(iterator, "aclose"):
+                    await iterator.aclose()
+            finally:
+                try:
+                    await self.andjson_end()
+                except tornado.iostream.StreamClosedError:
+                    self._ndjson_disconnected = True
+                finally:
+                    self._ndjson_task = None
